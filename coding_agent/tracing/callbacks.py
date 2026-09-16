@@ -23,9 +23,12 @@ class LocalTraceCallbackHandler(BaseCallbackHandler):
     run_inline = True
     raise_error = False
 
-    def __init__(self, recorder: TraceRecorder) -> None:
+    def __init__(
+        self, recorder: TraceRecorder, *, prompt_metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
         self.recorder = recorder
+        self.prompt_metadata = prompt_metadata
         self._spans: dict[str, str] = {}
         self._lock = threading.RLock()
 
@@ -45,6 +48,7 @@ class LocalTraceCallbackHandler(BaseCallbackHandler):
             name="model.call",
             kind="model",
             inputs={"serialized": serialized, "messages": messages},
+            attributes={"prompt": self.prompt_metadata} if self.prompt_metadata else None,
         )
 
     def on_llm_start(
@@ -63,6 +67,7 @@ class LocalTraceCallbackHandler(BaseCallbackHandler):
             name="model.call",
             kind="model",
             inputs={"serialized": serialized, "prompts": prompts},
+            attributes={"prompt": self.prompt_metadata} if self.prompt_metadata else None,
         )
 
     def on_llm_end(
@@ -206,6 +211,7 @@ class LocalTraceCallbackHandler(BaseCallbackHandler):
         name: str,
         kind: str,
         inputs: Any,
+        attributes: dict[str, Any] | None = None,
     ) -> None:
         try:
             span_id = self.recorder.start_span(
@@ -213,6 +219,7 @@ class LocalTraceCallbackHandler(BaseCallbackHandler):
                 kind=kind,
                 parent_span_id=self._parent(parent_run_id),
                 inputs=inputs,
+                attributes=attributes,
             )
             with self._lock:
                 self._spans[str(run_id)] = span_id

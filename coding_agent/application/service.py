@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import mimetypes
 import os
 import sqlite3
@@ -27,6 +26,7 @@ from coding_agent.config import (
 from coding_agent.coordinator import TurnCancelled, TurnCoordinator
 from coding_agent.errors import CodingAgentError, fail
 from coding_agent.models import SessionRecord
+from coding_agent.prompting import event_text
 from coding_agent.repository import SqliteCheckpointRepository
 from coding_agent.runtime import AgentRuntime, approve_by_default
 from coding_agent.subagents import SubagentDemoManager
@@ -499,6 +499,7 @@ class CodingAgentHost:
                     "committing",
                     expected=("running",),
                 ),
+                **({"message_origin": "subagent_scheduler"} if wake_id else {}),
             )
             if cancelled.is_set():
                 raise fail("OPERATION_CANCELLED", "The Agent operation was cancelled.")
@@ -813,7 +814,8 @@ class CodingAgentHost:
                 return
             cancelled = threading.Event()
             self._operation_tokens[operation_id] = cancelled
-            message = json.dumps(
+            message = event_text(
+                "subagent_wake",
                 {
                     "origin": "subagent_scheduler",
                     "wake_id": wake["wake_id"],
@@ -821,12 +823,7 @@ class CodingAgentHost:
                     "attempt_id": wake["attempt_id"],
                     "type": wake["wake_type"],
                     "payload": wake["payload"],
-                    "instruction": (
-                        "Inspect the child task now and decide whether to accept, revise, "
-                        "answer, grant capabilities, or cancel it."
-                    ),
                 },
-                ensure_ascii=False,
             )
             self._schedule_operation(
                 operation_id,

@@ -9,6 +9,7 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 
 from coding_agent.execution.host import HostExecutionBackend
 from coding_agent.models import CommandRequest
+from coding_agent.prompting import assemble_prompt
 from coding_agent.tracing import MetricsLangSmithExporter, TraceRecorder, TraceStore
 from coding_agent.tracing.callbacks import LocalTraceCallbackHandler
 from coding_agent.tracing.context import activate_recorder
@@ -259,6 +260,26 @@ def test_callback_collects_model_usage(tmp_path: Path) -> None:
     )
     assert dict(row) == {"input_tokens": 9, "output_tokens": 3}
     store.close()
+
+
+def test_callback_records_prompt_manifest_on_each_model_call(tmp_path: Path) -> None:
+    store, recorder = make_recorder(tmp_path)
+    manifest = assemble_prompt(role_instruction="private task input").metadata()
+    callback = LocalTraceCallbackHandler(recorder, prompt_metadata=manifest)
+    try:
+        for _ in range(2):
+            callback.on_chat_model_start({}, [[AIMessage(content="hello")]], run_id=uuid4())
+        rows = store.query_all(
+            "SELECT attributes_json FROM spans WHERE name = 'model.call'",
+        )
+        assert len(rows) == 2
+        for row in rows:
+            attributes = json.loads(row["attributes_json"])
+            assert attributes["prompt"] == manifest
+            assert "private task input" not in row["attributes_json"]
+    finally:
+        recorder.finish(status="completed")
+        store.close()
 
 
 def test_cache_usage_accumulates_across_model_calls(tmp_path: Path) -> None:

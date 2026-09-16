@@ -45,7 +45,7 @@ from coding_agent.context.config import resolve_context_config
 from coding_agent.errors import fail
 from coding_agent.execution import ToolRunManager, activate_tool_turn
 from coding_agent.mcp import LazyMCPToolProvider
-from coding_agent.prompts import build_system_prompt
+from coding_agent.prompting import assemble_prompt, event_text
 from coding_agent.sandbox import (
     DockerCliProvider,
     ResourceBudget,
@@ -180,9 +180,16 @@ class AgentRuntime:
         tools = [*local_tools, *self.mcp_provider.tools, *(extra_tools or [])]
         if allowed_tool_names is not None:
             tools = [tool for tool in tools if tool.name in allowed_tool_names]
-        system_prompt = build_system_prompt(skill_catalog) + (
-            f"\n\nAssigned role:\n{role_instruction}" if role_instruction else ""
-        )
+        try:
+            self.prompt_bundle = assemble_prompt(
+                skill_catalog=skill_catalog, role_instruction=role_instruction, tools=tools,
+            )
+        except BaseException:
+            self.mcp_provider.close()
+            self.tool_runs.close()
+            self.execution_service.close()
+            raise
+        system_prompt = self.prompt_bundle.text
         self.context_config = resolve_context_config(model_name)
         self.accountant = ContextAccountant(self.context_config)
         self._context_tools = tools
@@ -249,6 +256,7 @@ class AgentRuntime:
         on_tool_event: ToolEventCallback | None = None,
         cancelled: threading.Event | None = None,
         cancellation_code: str = "OPERATION_CANCELLED",
+        message_origin: str = "user",
     ) -> tuple[str, str]:
         """Run one turn, resolving command interrupts through the callback."""
         config = self.graph_config(thread_id)
@@ -259,7 +267,10 @@ class AgentRuntime:
         if hasattr(self, "accountant"):
             callbacks.append(ContextUsageCallbackHandler(self.accountant))
         if recorder is not None:
-            callbacks.append(LocalTraceCallbackHandler(recorder))
+            bundle = getattr(self, "prompt_bundle", None)
+            callbacks.append(LocalTraceCallbackHandler(
+                recorder, prompt_metadata=bundle.metadata() if bundle else None,
+            ))
         config["callbacks"] = callbacks
         try:
             with (
@@ -274,7 +285,10 @@ class AgentRuntime:
                 ),
             ):
                 result = self._run_with_approvals(
-                    {"messages": [{"role": "user", "content": user_text}]},
+                    {"messages": [{
+                        "role": "user", "content": user_text,
+                        "additional_kwargs": {"origin": message_origin},
+                    }]},
                     config,
                     thread_id,
                     approve,
@@ -317,14 +331,12 @@ class AgentRuntime:
                             "messages": [
                                 {
                                     "role": "user",
-                                    "content": (
-                                        "[Tool scheduler] Background tools still require a "
-                                        f"decision. Wake reason: {wake['wake_reason']}. "
-                                        f"Run IDs: {', '.join(active_run_ids)}. Inspect their "
-                                        "latest output, then wait, cancel, or start an "
-                                        "independent parallel tool. Do not finish while any "
-                                        "tool is active."
-                                    ),
+                                    "content": event_text("tool_wake", {
+                                        "origin": "tool_scheduler",
+                                        "wake_reason": wake["wake_reason"],
+                                        "run_ids": active_run_ids,
+                                    }),
+                                    "additional_kwargs": {"origin": "tool_scheduler"},
                                 }
                             ]
                         },
@@ -354,11 +366,8 @@ class AgentRuntime:
                             "messages": [
                                 {
                                     "role": "user",
-                                    "content": (
-                                        "[Tool scheduler] The wake limit was reached and all "
-                                        "remaining tools were cancelled. Provide the final "
-                                        "answer without starting another tool."
-                                    ),
+                                    "content": event_text("tool_limit"),
+                                    "additional_kwargs": {"origin": "tool_scheduler"},
                                 }
                             ]
                         },
@@ -691,10 +700,7 @@ class AgentRuntime:
                         {
                             "ok": False,
                             "error_code": "INVALID_TOOL_CALL",
-                            "message": (
-                                f"Arguments for {call.get('name') or 'tool'} were malformed. "
-                                "Retry with smaller valid arguments."
-                            ),
+                            "message": event_text("invalid_call", {"tool": call.get("name")}),
                         }
                     ),
                     tool_call_id=str(call["id"]),
@@ -790,10 +796,7 @@ class AgentRuntime:
                     {
                         "ok": False,
                         "error_code": "TOOL_CALL_INTERRUPTED",
-                        "message": (
-                            "The previous Agent operation ended before this tool call "
-                            "completed. Re-evaluate whether it should be retried."
-                        ),
+                        "message": event_text("interrupted_call"),
                     }
                 ),
                 tool_call_id=str(call["id"]),

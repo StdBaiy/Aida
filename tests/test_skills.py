@@ -309,6 +309,11 @@ def test_runtime_uses_base_prompt_without_skills(
         checkpoint_path=tmp_path / "checkpoints.db",
     )
 
-    assert captured["system_prompt"] == SYSTEM_PROMPT
+    assert captured["system_prompt"].startswith(SYSTEM_PROMPT)
+    assert "skill_catalog" not in captured["system_prompt"]
+    assert "Configured MCP:" not in captured["system_prompt"]
+    assert "Delegation:" not in captured["system_prompt"]
+    assert "Patch protocol:" in captured["system_prompt"]
+    assert runtime.prompt_bundle.metadata()["profile"] == "coding-agent-v2"
     assert "load_skill" in {item.name for item in captured["tools"]}
     runtime.close()

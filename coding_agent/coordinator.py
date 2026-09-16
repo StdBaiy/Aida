@@ -79,6 +79,8 @@ class TurnCoordinator:
         on_tool_event: ToolEventCallback | None = None,
         cancelled: threading.Event | None = None,
         before_commit: Callable[[], bool] | None = None,
+        *,
+        message_origin: str = "user",
     ) -> str:
         """Run and jointly commit one user turn."""
         timeline = self.repository.active_timeline(self.session_id)
@@ -107,7 +109,7 @@ class TurnCoordinator:
             with recorder.span(
                 "agent.invoke",
                 kind="agent",
-                inputs={"user_message": user_text},
+                inputs={"user_message": user_text, "origin": message_origin},
             ) as invoke_span_id:
                 assistant_text, checkpoint_id = self.runtime.run_turn(
                     thread_id=execution_thread_id,
@@ -117,6 +119,7 @@ class TurnCoordinator:
                     on_token=on_token,
                     on_tool_event=on_tool_event,
                     cancelled=cancelled,
+                    **({"message_origin": message_origin} if message_origin != "user" else {}),
                 )
                 recorder.end_span(
                     invoke_span_id,

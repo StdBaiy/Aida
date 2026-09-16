@@ -188,6 +188,7 @@ def test_runtime_scheduler_wakes_model_until_tool_is_terminal() -> None:
         def stream(self, value: Any, *_args: Any, **_kwargs: Any) -> Any:
             self.calls += 1
             if self.calls == 1:
+                assert value["messages"][0]["additional_kwargs"]["origin"] == "subagent_scheduler"
                 manager.start_current(
                     name="slow",
                     effect="read_only",
@@ -196,6 +197,8 @@ def test_runtime_scheduler_wakes_model_until_tool_is_terminal() -> None:
                 text = "premature"
             else:
                 assert "Tool scheduler" in value["messages"][0]["content"]
+                assert value["messages"][0]["additional_kwargs"]["origin"] == "tool_scheduler"
+                assert '<runtime_event trust="data">' in value["messages"][0]["content"]
                 text = "final"
             yield "values", {"messages": [AIMessage(content=text)]}
 
@@ -212,6 +215,7 @@ def test_runtime_scheduler_wakes_model_until_tool_is_terminal() -> None:
         thread_id="thread",
         user_text="run",
         approve=lambda _request: True,
+        message_origin="subagent_scheduler",
     )
 
     assert response == "final"

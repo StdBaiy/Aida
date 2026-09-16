@@ -23,6 +23,24 @@ Seatbelt MVP 允许读取系统运行时和明确配置的工具链目录，只�
 （`.git` 除外）及每次执行独立的临时 HOME。它不提供容器或 microVM 级内核隔离，也不能
 可靠限制 CPU、内存和 PID；高风险恶意代码仍应使用 OCI、gVisor 或 microVM Provider。
 
+## 提示词维护
+
+提示词资源位于 `coding_agent/prompting/assets/`，`manifest.json` 声明 profile、版本、
+owner、组件文件和所需工具。修改文本时同步更新组件版本和 profile 版本，重建 Runtime 后生效。
+`coding_agent/prompts.py` 保留旧调用入口，Runtime 使用 `assemble_prompt()` 统一组装。
+
+- 固定规则根据实际工具集合选择；只读子 Agent 不会收到 Skill 加载或父任务调度协议。
+- Skill 目录、子任务合同、阶段分析和调度 payload 有独立数据边界、长度限制和标签转义。
+  超限返回 `PROMPT_CONTEXT_TOO_LARGE`，不静默丢失上下文。转义不替代权限校验。
+- `model.call` 本地 trace 的 `prompt` 属性包含 profile/version、组件来源、字符数、
+  bundle/system/tool schema/events digest；该元数据不包含动态正文。
+- 调度事件继续使用兼容的 user 消息传输，来源在消息元数据中单独记录；
+  尚未迁移到独立的 graph event channel。远端 LangSmith 仍只上传原有聚合指标。
+- 当前仍使用完整 Skill 目录，尚未启用 top-k、workspace policy、远端 Prompt Hub 或模型行为评测。
+
+回归命令：`uv run pytest tests/test_prompting.py tests/test_skills.py tests/test_tracing.py -q`。
+设计和分阶段进度见 [提示词系统分析](PROMPT_SYSTEM_ANALYSIS.md)。
+
 ## 安装
 
 ```bash

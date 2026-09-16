@@ -16,6 +16,7 @@ from langchain_core.tools import BaseTool, tool
 from coding_agent.config import AgentConfig
 from coding_agent.errors import CodingAgentError, fail
 from coding_agent.models import Workspace, utc_now
+from coding_agent.prompting import child_contract, phase_context
 from coding_agent.repository import new_id
 from coding_agent.subagents.repository import SubagentRepository
 from coding_agent.subagents.results import build_result_envelope
@@ -371,6 +372,10 @@ class SubagentDemoManager:
                 "SUBAGENT_CONTRACT_INVALID",
                 "name, objective, scope, acceptance, and allowed_tools must not be empty.",
             )
+        child_contract(
+            objective=objective, scope=scope, acceptance=acceptance,
+            workspace_mode=workspace_mode,
+        )
         return {
             "name": name,
             "objective": objective,
@@ -948,19 +953,13 @@ class SubagentDemoManager:
                 "workspace_state": "ready" if allocated else "unallocated",
             },
         )
-        role_instruction = (
-            "You are a non-recursive child coding Agent. Complete only this contract.\n"
-            f"Objective: {contract['objective']}\n"
-            f"Allowed scope: {json.dumps(contract['scope'], ensure_ascii=False)}\n"
-            f"Acceptance: {json.dumps(contract['acceptance'], ensure_ascii=False)}\n"
-            f"Review feedback: {task.get('feedback') or 'none'}\n"
-            f"Parent responses: "
-            f"{json.dumps(contract.get('parent_responses', []), ensure_ascii=False)}\n"
-            f"Workspace mode: {workspace_mode}\n"
-            "Do not create or manage other agents. Inspect before editing, keep changes in scope, "
-            "run focused checks, and finish with changed files, checks, and remaining risks. "
-            "When workspace mode is auto, call request_workspace before making any file change. "
-            "Finish by calling submit_agent_result exactly once with a concise structured result."
+        role_instruction = child_contract(
+            objective=contract["objective"],
+            scope=contract["scope"],
+            acceptance=contract["acceptance"],
+            feedback=task.get("feedback") or "",
+            parent_responses=contract.get("parent_responses", []),
+            workspace_mode=workspace_mode,
         )
         self._event(
             run_id,
@@ -1137,11 +1136,7 @@ class SubagentDemoManager:
                         (*contract["local_tools"], *mcp_entry_tools, *parent_tool_names)
                     ),
                     extra_tools=parent_tools,
-                    user_text=(
-                        f"{contract['objective']}\n\n"
-                        f"Prior read-only analysis:\n{response}\n\n"
-                        "The isolated worktree is ready. Complete the requested changes."
-                    ),
+                    user_text=phase_context(contract["objective"], response),
                 )
             elif not parent_request:
                 result = build_result_envelope(

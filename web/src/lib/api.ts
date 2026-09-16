@@ -142,6 +142,8 @@ export type SettingsConfig = {
   langsmith_enabled: boolean;
   langsmith_project: string;
   model_timeout_seconds: number;
+  main_agent_model_call_limit: number;
+  subagent_model_call_limit: number;
   command_timeout_seconds: number;
   max_parallel_sessions: number;
   sandbox_enabled: boolean;

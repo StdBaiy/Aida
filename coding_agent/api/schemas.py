@@ -30,6 +30,8 @@ class SettingsUpdate(BaseModel):
     langsmith_enabled: bool
     langsmith_project: str = Field(min_length=1, max_length=200)
     model_timeout_seconds: int = Field(ge=1, le=1800)
+    main_agent_model_call_limit: int = Field(ge=1, le=200)
+    subagent_model_call_limit: int = Field(ge=1, le=200)
     command_timeout_seconds: int = Field(ge=1, le=1800)
     max_parallel_sessions: int = Field(ge=1, le=16)
 

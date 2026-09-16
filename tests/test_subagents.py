@@ -151,6 +151,7 @@ def test_main_agent_can_dispatch_two_isolated_tasks_and_integrate_results(
     root = repository(tmp_path)
     started = threading.Barrier(2)
     granted_tools: list[frozenset[str]] = []
+    model_call_limits: list[int] = []
 
     class FakeChildRuntime:
         def __init__(
@@ -164,6 +165,7 @@ def test_main_agent_can_dispatch_two_isolated_tasks_and_integrate_results(
             self.workspace_root = workspace_root
             self.role_instruction = role_instruction
             granted_tools.append(allowed_tool_names)
+            model_call_limits.append(_kwargs["model_call_limit"])
 
         def initialize_thread(self, _thread_id: str) -> str:
             return "checkpoint"
@@ -184,7 +186,11 @@ def test_main_agent_can_dispatch_two_isolated_tasks_and_integrate_results(
     monkeypatch.setattr("coding_agent.runtime.AgentRuntime", FakeChildRuntime)
     manager = SubagentDemoManager(
         resolve_workspace(root),
-        AgentConfig(model="test", api_key="test-key"),
+        AgentConfig(
+            model="test",
+            api_key="test-key",
+            subagent_model_call_limit=37,
+        ),
     )
     manager.bind_session("session-1")
     try:
@@ -229,6 +235,7 @@ def test_main_agent_can_dispatch_two_isolated_tasks_and_integrate_results(
         assert (root / "backend.txt").is_file()
         assert (root / "frontend.txt").is_file()
         assert len(granted_tools) == 2
+        assert model_call_limits == [37, 37]
         assert all(
             tools
             == {

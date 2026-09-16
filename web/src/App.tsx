@@ -839,6 +839,8 @@ export function App() {
         langsmith_enabled: values.langsmith_enabled,
         langsmith_project: values.langsmith_project,
         model_timeout_seconds: values.model_timeout_seconds,
+        main_agent_model_call_limit: values.main_agent_model_call_limit,
+        subagent_model_call_limit: values.subagent_model_call_limit,
         command_timeout_seconds: values.command_timeout_seconds,
         max_parallel_sessions: values.max_parallel_sessions,
       });
@@ -2726,6 +2728,44 @@ function SettingsDialog({
                   required
                 />
                 <span>秒</span>
+              </div>
+            </label>
+            <label className="setting-field">
+              <span>主 Agent 模型调用上限</span>
+              <div className="number-field">
+                <input
+                  value={form.main_agent_model_call_limit}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      main_agent_model_call_limit: Number(event.target.value),
+                    })
+                  }
+                  type="number"
+                  min={1}
+                  max={200}
+                  required
+                />
+                <span>次</span>
+              </div>
+            </label>
+            <label className="setting-field">
+              <span>子 Agent 模型调用上限</span>
+              <div className="number-field">
+                <input
+                  value={form.subagent_model_call_limit}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      subagent_model_call_limit: Number(event.target.value),
+                    })
+                  }
+                  type="number"
+                  min={1}
+                  max={200}
+                  required
+                />
+                <span>次</span>
               </div>
             </label>
             <label className="setting-field">

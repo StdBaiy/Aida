@@ -57,6 +57,7 @@ from coding_agent.sandbox import (
 from coding_agent.skill_execution import SkillExecutionManager, activate_skill_thread
 from coding_agent.skills import (
     SkillRegistry,
+    bind_trusted_skill_commands,
     default_skill_roots,
     discover_skills,
     format_skill_catalog,
@@ -95,6 +96,7 @@ class AgentRuntime:
         allowed_mcp_tool_names: frozenset[str] | None = None,
         mutation_gate: WorkspaceMutationGate | None = None,
         role_instruction: str | None = None,
+        model_call_limit: int | None = None,
     ) -> None:
         model_name = config.model.removeprefix("openai:")
         model = ChatOpenAI(
@@ -105,8 +107,12 @@ class AgentRuntime:
             timeout=config.model_timeout_seconds,
             use_responses_api=False,
         )
-        self.skill_registry = SkillRegistry(
+        skills = bind_trusted_skill_commands(
             discover_skills(default_skill_roots(workspace_root)),
+            config.trusted_skill_commands,
+        )
+        self.skill_registry = SkillRegistry(
+            skills,
             max_read_bytes=config.max_read_bytes,
         )
         self.tool_runs = ToolRunManager(
@@ -115,6 +121,11 @@ class AgentRuntime:
         )
         self.tool_probe_interval_seconds = config.tool_probe_interval_seconds
         self.max_tool_scheduler_wakes = config.max_tool_scheduler_wakes
+        self.model_call_limit = (
+            model_call_limit
+            if model_call_limit is not None
+            else config.main_agent_model_call_limit
+        )
         self.mutation_gate = mutation_gate
         self.sandbox_provider: SandboxExecutionProvider
         if config.sandbox_provider == "seatbelt":
@@ -169,6 +180,7 @@ class AgentRuntime:
                 self.execution_service,
             ),
             self.skill_registry.tool,
+            self.skill_registry.resource_tool,
             *self.skill_execution.tools,
             *self.tool_runs.tools,
         ]
@@ -207,7 +219,10 @@ class AgentRuntime:
             "list[AgentMiddleware[Any, None, Any]]",
             [
                 ModelRetryMiddleware(max_retries=2),
-                ModelCallLimitMiddleware(run_limit=20, exit_behavior="end"),
+                ModelCallLimitMiddleware(
+                    run_limit=self.model_call_limit,
+                    exit_behavior="end",
+                ),
                 ToolCallLimitMiddleware(run_limit=50, exit_behavior="end"),
                 HumanInTheLoopMiddleware(
                     interrupt_on={

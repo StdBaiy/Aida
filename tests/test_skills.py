@@ -1,10 +1,11 @@
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from coding_agent.config import AgentConfig
+from coding_agent.config import AgentConfig, TrustedSkillCommandConfig
 from coding_agent.errors import CodingAgentError
 from coding_agent.prompts import SYSTEM_PROMPT, build_system_prompt
 from coding_agent.runtime import AgentRuntime
@@ -13,6 +14,7 @@ from coding_agent.skills import (
     Skill,
     SkillRegistry,
     SkillRoot,
+    bind_trusted_skill_commands,
     default_skill_roots,
     discover_skills,
     format_skill_catalog,
@@ -153,13 +155,15 @@ def test_user_root_allows_preconfigured_external_skill_symlink(tmp_path: Path) -
     ) == [Skill("shared", "Task help.", "user", target.resolve())]
 
 
-def test_first_root_wins_for_duplicate_skill_names(tmp_path: Path) -> None:
+def test_duplicate_skill_names_keep_namespaces_and_bare_name_precedence(
+    tmp_path: Path,
+) -> None:
     workspace_root = tmp_path / "workspace-skills"
     user_root = tmp_path / "user-skills"
     workspace_skill = _write_skill(
         workspace_root, "shared", _skill_body("shared", "Workspace version.")
     )
-    _write_skill(user_root, "shared", _skill_body("shared", "User version."))
+    user_skill = _write_skill(user_root, "shared", _skill_body("shared", "User version."))
 
     skills = discover_skills(
         [
@@ -169,8 +173,38 @@ def test_first_root_wins_for_duplicate_skill_names(tmp_path: Path) -> None:
     )
 
     assert skills == [
-        Skill("shared", "Workspace version.", "workspace", workspace_skill.resolve())
+        Skill("shared", "Workspace version.", "workspace", workspace_skill.resolve()),
+        Skill("shared", "User version.", "user", user_skill.resolve()),
     ]
+    registry = SkillRegistry(skills, max_read_bytes=4096)
+    assert registry.get("shared").id == "workspace:shared"
+    assert registry.get("workspace:shared").description == "Workspace version."
+    assert registry.get("user:shared").description == "User version."
+
+
+def test_duplicate_skill_catalog_exposes_qualified_selectors(tmp_path: Path) -> None:
+    workspace_skill = _write_skill(
+        tmp_path / "workspace",
+        "shared",
+        _skill_body("shared", "Workspace version."),
+    )
+    user_skill = _write_skill(
+        tmp_path / "user",
+        "shared",
+        _skill_body("shared", "User version."),
+    )
+
+    catalog = format_skill_catalog(
+        [
+            Skill("shared", "Workspace version.", "workspace", workspace_skill.resolve()),
+            Skill("shared", "User version.", "user", user_skill.resolve()),
+        ]
+    )
+
+    assert "- workspace:shared [workspace, default]" in catalog
+    assert 'load_skill("workspace:shared")' in catalog
+    assert "- user:shared [user]" in catalog
+    assert 'load_skill("user:shared")' in catalog
 
 
 @pytest.mark.parametrize(
@@ -213,12 +247,76 @@ def test_registry_loads_full_skill_by_exact_name(tmp_path: Path) -> None:
 
     assert result["ok"] is True
     assert result["name"] == "alpha"
+    assert result["skill_id"] == "user:alpha"
     assert result["source"] == "user"
     assert result["content"] == _skill_body("alpha")
     assert result["requires_activation"] is False
     assert result["commands"] == {}
     assert result["mcp_servers"] == []
     assert registry.tool.name == "load_skill"
+
+
+def test_registry_loads_bounded_skill_resources(tmp_path: Path) -> None:
+    skill_path = _write_skill(tmp_path, "alpha", _skill_body("alpha"))
+    guide = skill_path.parent / "references" / "guide.md"
+    guide.parent.mkdir()
+    guide.write_text("# Guide\n", encoding="utf-8")
+    registry = SkillRegistry(
+        [Skill("alpha", "Task help.", "user", skill_path.resolve())],
+        max_read_bytes=1024,
+    )
+
+    result = registry.load_resource("user:alpha", "references/guide.md")
+
+    assert result == {
+        "ok": True,
+        "name": "alpha",
+        "skill_id": "user:alpha",
+        "path": "references/guide.md",
+        "content": "# Guide\n",
+    }
+    assert registry.resource_tool.name == "load_skill_resource"
+
+
+def test_registry_rejects_skill_resource_escape(tmp_path: Path) -> None:
+    skill_path = _write_skill(tmp_path / "skills", "alpha", _skill_body("alpha"))
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret", encoding="utf-8")
+    (skill_path.parent / "escape.md").symlink_to(outside)
+    registry = SkillRegistry(
+        [Skill("alpha", "Task help.", "user", skill_path.resolve())],
+        max_read_bytes=1024,
+    )
+
+    traversal = registry.resource_tool.invoke(
+        {"skill_name": "alpha", "relative_path": "../outside.md"}
+    )
+    symlink = registry.resource_tool.invoke({"skill_name": "alpha", "relative_path": "escape.md"})
+
+    assert traversal["error_code"] == "SKILL_RESOURCE_PATH_INVALID"
+    assert symlink["error_code"] == "SKILL_RESOURCE_OUTSIDE_ROOT"
+
+
+def test_bind_trusted_commands_requires_exact_skill_id(tmp_path: Path) -> None:
+    skill_path = _write_skill(tmp_path, "alpha", _skill_body("alpha"))
+    skill = Skill("alpha", "Task help.", "user", skill_path.resolve())
+    executable = shutil.which("printf")
+    assert executable is not None
+    command = TrustedSkillCommandConfig(
+        description="Print.",
+        argv=[executable, "%s"],
+    )
+
+    [bound] = bind_trusted_skill_commands(
+        [skill],
+        {"user:alpha": {"print": command}},
+    )
+
+    assert bound.has_executable_capabilities
+    assert bound.trusted_commands["print"].argv[0] == str(Path(executable).resolve())
+    with pytest.raises(CodingAgentError) as exc_info:
+        bind_trusted_skill_commands([skill], {"workspace:alpha": {"print": command}})
+    assert exc_info.value.code == "TRUSTED_SKILL_NOT_FOUND"
 
 
 def test_registry_rejects_unknown_names_without_path_lookup(tmp_path: Path) -> None:
@@ -280,7 +378,11 @@ def test_runtime_injects_catalog_and_load_skill_tool(
         lambda _workspace: [SkillRoot(root, "workspace")],
     )
     runtime = AgentRuntime(
-        config=AgentConfig(model="test-model", api_key="test-key"),
+        config=AgentConfig(
+            model="test-model",
+            api_key="test-key",
+            main_agent_model_call_limit=33,
+        ),
         workspace_root=tmp_path,
         repo_root=tmp_path,
         checkpoint_path=tmp_path / "checkpoints.db",
@@ -288,6 +390,8 @@ def test_runtime_injects_catalog_and_load_skill_tool(
 
     assert "- alpha [workspace]: Alpha task help." in captured["system_prompt"]
     assert "load_skill" in {item.name for item in captured["tools"]}
+    assert "load_skill_resource" in {item.name for item in captured["tools"]}
+    assert runtime.model_call_limit == 33
     runtime.close()
 
 
@@ -316,4 +420,5 @@ def test_runtime_uses_base_prompt_without_skills(
     assert "Patch protocol:" in captured["system_prompt"]
     assert runtime.prompt_bundle.metadata()["profile"] == "coding-agent-v2"
     assert "load_skill" in {item.name for item in captured["tools"]}
+    assert "load_skill_resource" in {item.name for item in captured["tools"]}
     runtime.close()

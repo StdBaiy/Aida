@@ -14,11 +14,15 @@ from langchain_core.tools import BaseTool, tool
 
 from coding_agent.config import AgentConfig
 from coding_agent.errors import CodingAgentError, fail
-from coding_agent.execution import CommandPolicy, ToolRunManager
+from coding_agent.execution import (
+    CommandPolicy,
+    ToolRunManager,
+    TrustedSkillExecutionService,
+)
 from coding_agent.mcp import MCPToolProvider
 from coding_agent.models import CommandRequest
 from coding_agent.sandbox import SandboxExecutionService
-from coding_agent.skills import Skill, SkillRegistry
+from coding_agent.skills import Skill, SkillRegistry, TrustedSkillCommand
 from coding_agent.tracing.context import active_recorder
 
 _active_thread_id: ContextVar[str | None] = ContextVar("active_skill_thread_id", default=None)
@@ -44,12 +48,17 @@ class SkillExecutionManager:
         workspace_root: Path,
         config: AgentConfig,
         execution_service: SandboxExecutionService,
+        trusted_execution_service: TrustedSkillExecutionService | None = None,
         tool_runs: ToolRunManager | None = None,
     ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root.resolve(strict=True)
         self._policy = CommandPolicy()
         self._execution_service = execution_service
+        self._trusted_execution_service = trusted_execution_service or TrustedSkillExecutionService(
+            self.workspace_root,
+            max_output_bytes=config.max_command_output_bytes,
+        )
         self._tool_runs = tool_runs or ToolRunManager(
             max_output_bytes=config.max_command_output_bytes
         )
@@ -112,11 +121,12 @@ class SkillExecutionManager:
                 f"Skill has no executable capabilities: {skill_name}",
             )
         with self._lock:
-            self._authorized.setdefault(thread_id, set()).add(skill_name)
+            self._authorized.setdefault(thread_id, set()).add(skill.id)
 
     def is_authorized(self, thread_id: str, skill_name: str) -> bool:
+        skill = self.registry.get(skill_name)
         with self._lock:
-            return skill_name in self._authorized.get(thread_id, set())
+            return skill.id in self._authorized.get(thread_id, set())
 
     def activation_summary(self, skill_name: str) -> dict[str, object]:
         """Describe executable capabilities for an informed approval prompt."""
@@ -135,9 +145,23 @@ class SkillExecutionManager:
                 {
                     "name": name,
                     "description": command.description,
+                    "execution": "sandbox",
                     **command_spec,
                     "allow_args": command.allow_args,
                     "environment": sorted(command.env_from_env.values()),
+                }
+            )
+        for name, trusted_command in skill.trusted_commands.items():
+            commands.append(
+                {
+                    "name": name,
+                    "description": trusted_command.description,
+                    "execution": "trusted_host",
+                    "argv": list(trusted_command.argv),
+                    "allow_args": trusted_command.allow_args,
+                    "environment": sorted(trusted_command.env_from_env.values()),
+                    "network": "host",
+                    "home_access": True,
                 }
             )
         mcp_servers = [
@@ -150,6 +174,7 @@ class SkillExecutionManager:
         ]
         return {
             "skill": skill.name,
+            "skill_id": skill.id,
             "source": skill.source,
             "commands": commands,
             "mcp_servers": mcp_servers,
@@ -160,7 +185,7 @@ class SkillExecutionManager:
         thread_id = self._require_thread()
         skill = self.registry.get(skill_name)
         self._require_authorized(thread_id, skill)
-        key = (thread_id, skill.name)
+        key = (thread_id, skill.id)
         with self._lock:
             if skill.manifest.mcp_servers and key not in self._mcp_providers:
                 self._mcp_providers[key] = MCPToolProvider(skill.manifest.mcp_servers)
@@ -168,10 +193,11 @@ class SkillExecutionManager:
         return {
             "ok": True,
             "skill": skill.name,
+            "skill_id": skill.id,
             "commands": {
-                name: command.description
-                for name, command in skill.manifest.commands.items()
-            },
+                name: command.description for name, command in skill.manifest.commands.items()
+            }
+            | {name: command.description for name, command in skill.trusted_commands.items()},
             "mcp_tools": self._describe_mcp_tools(provider),
         }
 
@@ -183,12 +209,34 @@ class SkillExecutionManager:
     ) -> dict[str, object]:
         """Execute one approved manifest command without a shell."""
         thread_id = self._require_thread()
-        request, environment = self._prepare_command(thread_id, skill_name, command_name, args)
-        result = self._execution_service.run(request, extra_env=environment)
+        skill, request, environment, trusted = self._prepare_command(
+            thread_id,
+            skill_name,
+            command_name,
+            args,
+        )
+        result = (
+            self._trusted_execution_service.run(
+                trusted,
+                args,
+                extra_env=environment,
+            )
+            if trusted is not None
+            else self._execution_service.run(request, extra_env=environment)
+        )
         return {
             "ok": True,
-            "skill": skill_name,
+            "skill": skill.name,
+            "skill_id": skill.id,
             "command": command_name,
+            **(
+                {
+                    "executable": trusted.argv[0],
+                    "approval_scope": "thread",
+                }
+                if trusted is not None
+                else {}
+            ),
             **result.model_dump(),
         }
 
@@ -202,22 +250,47 @@ class SkillExecutionManager:
     ) -> dict[str, object]:
         """Validate and submit one Skill command to the turn-scoped runner."""
         thread_id = self._require_thread()
-        request, environment = self._prepare_command(thread_id, skill_name, command_name, args)
+        skill, request, environment, trusted = self._prepare_command(
+            thread_id,
+            skill_name,
+            command_name,
+            args,
+        )
         recorder = active_recorder()
         return self._tool_runs.start_current(
-            name=f"skill:{skill_name}.{command_name}",
-            effect="workspace_write",
+            name=f"skill:{skill.id}.{command_name}",
+            effect="external" if trusted is not None else "workspace_write",
             execution_group_id=execution_group_id,
             work=lambda cancel_event, on_output: {
                 "ok": True,
-                "skill": skill_name,
+                "skill": skill.name,
+                "skill_id": skill.id,
                 "command": command_name,
-                **self._execution_service.run(
-                    request,
-                    extra_env=environment,
-                    cancel_event=cancel_event,
-                    on_output=on_output,
-                    recorder=recorder,
+                **(
+                    {
+                        "executable": trusted.argv[0],
+                        "approval_scope": "thread",
+                    }
+                    if trusted is not None
+                    else {}
+                ),
+                **(
+                    self._trusted_execution_service.run(
+                        trusted,
+                        args,
+                        extra_env=environment,
+                        cancel_event=cancel_event,
+                        on_output=on_output,
+                        recorder=recorder,
+                    )
+                    if trusted is not None
+                    else self._execution_service.run(
+                        request,
+                        extra_env=environment,
+                        cancel_event=cancel_event,
+                        on_output=on_output,
+                        recorder=recorder,
+                    )
                 ).model_dump(),
             },
         )
@@ -228,32 +301,43 @@ class SkillExecutionManager:
         skill_name: str,
         command_name: str,
         args: list[str],
-    ) -> tuple[CommandRequest, dict[str, str]]:
+    ) -> tuple[Skill, CommandRequest, dict[str, str], TrustedSkillCommand | None]:
         skill = self.registry.get(skill_name)
         self._require_authorized(thread_id, skill)
         command = skill.manifest.commands.get(command_name)
-        if command is None:
+        trusted = skill.trusted_commands.get(command_name)
+        if command is None and trusted is None:
             raise fail(
                 "SKILL_COMMAND_NOT_FOUND",
-                f"Skill {skill_name} does not declare command: {command_name}",
+                f"Skill {skill.id} does not declare command: {command_name}",
             )
-        if args and not command.allow_args:
+        if command is not None:
+            allow_args = command.allow_args
+            prefix = self._command_prefix(skill, command_name)
+            timeout_seconds = command.timeout_seconds
+            environment_mapping = command.env_from_env
+        else:
+            assert trusted is not None
+            allow_args = trusted.allow_args
+            prefix = list(trusted.argv)
+            timeout_seconds = trusted.timeout_seconds
+            environment_mapping = trusted.env_from_env
+        if args and not allow_args:
             raise fail(
                 "SKILL_ARGUMENTS_DENIED",
                 f"Skill command does not accept additional arguments: {command_name}",
             )
-        prefix = self._command_prefix(skill, command_name)
         request = CommandRequest(
             argv=[*prefix, *args],
             cwd=".",
-            timeout_seconds=command.timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
         self._policy.validate(request)
         environment = self._resolve_environment(
-            command.env_from_env,
-            capability=f"{skill_name}.{command_name}",
+            environment_mapping,
+            capability=f"{skill.id}.{command_name}",
         )
-        return request, environment
+        return skill, request, environment, trusted
 
     def call_mcp(
         self,
@@ -266,21 +350,22 @@ class SkillExecutionManager:
         skill = self.registry.get(skill_name)
         self._require_authorized(thread_id, skill)
         with self._lock:
-            provider = self._mcp_providers.get((thread_id, skill_name))
+            provider = self._mcp_providers.get((thread_id, skill.id))
         if provider is None:
             raise fail(
                 "SKILL_NOT_ACTIVE",
-                f"Activate Skill {skill_name} before calling its MCP tools.",
+                f"Activate Skill {skill.id} before calling its MCP tools.",
             )
         remote_tool = next((item for item in provider.tools if item.name == tool_name), None)
         if remote_tool is None:
             raise fail(
                 "SKILL_MCP_TOOL_NOT_FOUND",
-                f"Skill {skill_name} does not expose MCP tool: {tool_name}",
+                f"Skill {skill.id} does not expose MCP tool: {tool_name}",
             )
         return {
             "ok": True,
-            "skill": skill_name,
+            "skill": skill.name,
+            "skill_id": skill.id,
             "tool": tool_name,
             "result": remote_tool.invoke(arguments),
         }
@@ -298,12 +383,12 @@ class SkillExecutionManager:
         skill = self.registry.get(skill_name)
         self._require_authorized(thread_id, skill)
         return self._tool_runs.start_current(
-            name=f"skill-mcp:{skill_name}.{tool_name}",
+            name=f"skill-mcp:{skill.id}.{tool_name}",
             effect="external",
             execution_group_id=execution_group_id,
             work=lambda _cancel_event, _on_output: self._call_mcp_in_thread(
                 thread_id,
-                skill_name,
+                skill.id,
                 tool_name,
                 arguments,
             ),
@@ -391,10 +476,12 @@ class SkillExecutionManager:
         return descriptions
 
     def _require_authorized(self, thread_id: str, skill: Skill) -> None:
-        if not self.is_authorized(thread_id, skill.name):
+        with self._lock:
+            authorized = skill.id in self._authorized.get(thread_id, set())
+        if not authorized:
             raise fail(
                 "SKILL_APPROVAL_REQUIRED",
-                f"Skill {skill.name} must be activated with user approval first.",
+                f"Skill {skill.id} must be activated with user approval first.",
             )
 
     @staticmethod

@@ -52,6 +52,8 @@ class FakeHost:
             "langsmith_enabled": False,
             "langsmith_project": "test-project",
             "model_timeout_seconds": 180,
+            "main_agent_model_call_limit": 20,
+            "subagent_model_call_limit": 20,
             "command_timeout_seconds": 120,
             "max_parallel_sessions": 4,
             "model_api_key_configured": True,
@@ -466,6 +468,8 @@ def test_api_bootstrap_cookie_csrf_and_origin() -> None:
                 "langsmith_enabled": True,
                 "langsmith_project": "next-project",
                 "model_timeout_seconds": 90,
+                "main_agent_model_call_limit": 30,
+                "subagent_model_call_limit": 40,
                 "command_timeout_seconds": 300,
                 "max_parallel_sessions": 6,
             },
@@ -474,6 +478,8 @@ def test_api_bootstrap_cookie_csrf_and_origin() -> None:
         assert host.updated_settings is not None
         assert host.updated_settings["model"] == "next-model"
         assert host.updated_settings["max_parallel_sessions"] == 6
+        assert host.updated_settings["main_agent_model_call_limit"] == 30
+        assert host.updated_settings["subagent_model_call_limit"] == 40
 
         started = client.post(
             "/api/v1/sessions/session/subagent-demo",

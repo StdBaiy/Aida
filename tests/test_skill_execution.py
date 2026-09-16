@@ -5,12 +5,17 @@ import pytest
 from langchain_core.tools import tool
 from pydantic import ValidationError
 
-from coding_agent.config import AgentConfig
+from coding_agent.config import AgentConfig, TrustedSkillCommandConfig
 from coding_agent.errors import CodingAgentError
 from coding_agent.execution.host import HostExecutionBackend
 from coding_agent.runtime import AgentRuntime
 from coding_agent.skill_execution import SkillExecutionManager, activate_skill_thread
-from coding_agent.skills import Skill, SkillManifest, SkillRegistry
+from coding_agent.skills import (
+    Skill,
+    SkillManifest,
+    SkillRegistry,
+    bind_trusted_skill_commands,
+)
 from coding_agent.workspace.paths import PathGuard
 
 
@@ -81,6 +86,38 @@ def test_skill_authorization_is_scoped_to_thread(tmp_path: Path) -> None:
     manager.close()
 
 
+def test_skill_authorization_is_scoped_to_namespaced_id(tmp_path: Path) -> None:
+    workspace_path = tmp_path / "workspace" / "SKILL.md"
+    workspace_path.parent.mkdir()
+    workspace_path.write_text("---\nname: alpha\ndescription: Workspace.\n---\n")
+    user_path = tmp_path / "user" / "SKILL.md"
+    user_path.parent.mkdir()
+    user_path.write_text("---\nname: alpha\ndescription: User.\n---\n")
+    manifest = SkillManifest.model_validate(
+        {"commands": {"echo": {"description": "Echo.", "argv": ["printf", "%s"]}}}
+    )
+    registry = SkillRegistry(
+        [
+            Skill("alpha", "Workspace.", "workspace", workspace_path.resolve(), manifest),
+            Skill("alpha", "User.", "user", user_path.resolve(), manifest),
+        ],
+        max_read_bytes=4096,
+    )
+    manager = SkillExecutionManager(
+        registry,
+        workspace_root=tmp_path,
+        config=AgentConfig(model="test", api_key="key"),
+        execution_service=cast(Any, HostExecutionBackend(PathGuard(tmp_path))),
+    )
+    manager.authorize("thread", "alpha")
+
+    with activate_skill_thread("thread"), pytest.raises(CodingAgentError) as exc_info:
+        manager.activate("user:alpha")
+
+    assert exc_info.value.code == "SKILL_APPROVAL_REQUIRED"
+    manager.close()
+
+
 def test_skill_script_must_resolve_inside_skill_directory(tmp_path: Path) -> None:
     manager, skill = _manager(
         tmp_path,
@@ -104,6 +141,93 @@ def test_skill_script_must_resolve_inside_skill_directory(tmp_path: Path) -> Non
 
     assert result["exit_code"] == 0
     assert result["stdout"] == "done\n"
+    manager.close()
+
+
+def test_trusted_skill_command_uses_host_home_and_reports_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text("---\nname: alpha\ndescription: Test.\n---\n")
+    cli = tmp_path / "trusted-cli"
+    cli.write_text(
+        '#!/bin/sh\nprintf \'%s|%s\' "$HOME" "$1"\n',
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    home = tmp_path / "real-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    [skill] = bind_trusted_skill_commands(
+        [Skill("alpha", "Test.", "user", skill_path.resolve())],
+        {
+            "user:alpha": {
+                "cli": TrustedSkillCommandConfig(
+                    description="Run trusted CLI.",
+                    argv=[str(cli)],
+                )
+            }
+        },
+    )
+
+    class SandboxMustNotRun:
+        def run(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("trusted command entered the sandbox")
+
+    manager = SkillExecutionManager(
+        SkillRegistry([skill], max_read_bytes=4096),
+        workspace_root=tmp_path,
+        config=AgentConfig(model="test", api_key="key"),
+        execution_service=cast(Any, SandboxMustNotRun()),
+    )
+    manager.authorize("thread", "user:alpha")
+
+    with activate_skill_thread("thread"):
+        result = manager.run_command("user:alpha", "cli", ["hello"])
+
+    assert result["stdout"] == f"{home}|hello"
+    assert result["provider"] == "trusted_host"
+    assert result["isolation_level"] == "none"
+    assert result["skill_id"] == "user:alpha"
+    assert result["approval_scope"] == "thread"
+    manager.close()
+
+
+def test_trusted_skill_command_fails_if_executable_changes(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text("---\nname: alpha\ndescription: Test.\n---\n")
+    cli = tmp_path / "trusted-cli"
+    cli.write_text("#!/bin/sh\nprintf original\n", encoding="utf-8")
+    cli.chmod(0o700)
+    [skill] = bind_trusted_skill_commands(
+        [Skill("alpha", "Test.", "user", skill_path.resolve())],
+        {
+            "user:alpha": {
+                "cli": TrustedSkillCommandConfig(
+                    description="Run trusted CLI.",
+                    argv=[str(cli)],
+                )
+            }
+        },
+    )
+    manager = SkillExecutionManager(
+        SkillRegistry([skill], max_read_bytes=4096),
+        workspace_root=tmp_path,
+        config=AgentConfig(model="test", api_key="key"),
+        execution_service=cast(Any, HostExecutionBackend(PathGuard(tmp_path))),
+    )
+    manager.authorize("thread", "user:alpha")
+    cli.write_text("#!/bin/sh\nprintf changed\n", encoding="utf-8")
+
+    with activate_skill_thread("thread"), pytest.raises(CodingAgentError) as exc_info:
+        manager.run_command("user:alpha", "cli", [])
+
+    assert exc_info.value.code == "TRUSTED_SKILL_EXECUTABLE_CHANGED"
     manager.close()
 
 
@@ -217,11 +341,13 @@ def test_runtime_approval_is_reused_for_same_thread(tmp_path: Path) -> None:
     assert len(requests) == 1
     assert requests[0]["skill_capabilities"] == {
         "skill": "alpha",
+        "skill_id": "workspace:alpha",
         "source": "workspace",
         "commands": [
             {
                 "name": "echo",
                 "description": "Echo.",
+                "execution": "sandbox",
                 "argv": ["printf", "%s"],
                 "allow_args": True,
                 "environment": [],

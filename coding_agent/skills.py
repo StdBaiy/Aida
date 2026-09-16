@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import shutil
+from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from coding_agent.config import MCPServerConfig
+from coding_agent.config import MCPServerConfig, TrustedSkillCommandConfig
 from coding_agent.errors import CodingAgentError, fail
 
 SKILLS_DIRECTORY = Path(".agents", "skills")
@@ -107,6 +111,18 @@ class SkillRoot:
 
 
 @dataclass(frozen=True)
+class TrustedSkillCommand:
+    """A host command resolved from explicit user configuration."""
+
+    description: str
+    argv: tuple[str, ...]
+    allow_args: bool
+    timeout_seconds: int
+    env_from_env: dict[str, str]
+    executable_digest: str
+
+
+@dataclass(frozen=True)
 class Skill:
     """One validated Skill addressable by its logical name."""
 
@@ -115,10 +131,18 @@ class Skill:
     source: str
     path: Path = field(repr=False)
     manifest: SkillManifest = field(default_factory=SkillManifest, repr=False)
+    trusted_commands: dict[str, TrustedSkillCommand] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    @property
+    def id(self) -> str:
+        return f"{self.source}:{self.name}"
 
     @property
     def has_executable_capabilities(self) -> bool:
-        return bool(self.manifest.commands or self.manifest.mcp_servers)
+        return bool(self.manifest.commands or self.manifest.mcp_servers or self.trusted_commands)
 
 
 def default_skill_roots(workspace_root: Path, home: Path | None = None) -> list[SkillRoot]:
@@ -133,16 +157,24 @@ def default_skill_roots(workspace_root: Path, home: Path | None = None) -> list[
 
 
 def discover_skills(roots: Iterable[SkillRoot]) -> list[Skill]:
-    """Discover valid Skills, keeping the first occurrence of each name."""
-    skills: dict[str, Skill] = {}
-    for configured_root in roots:
+    """Discover every namespaced Skill while preserving root precedence."""
+    configured_roots = list(roots)
+    namespaces = [root.source for root in configured_roots]
+    duplicate_namespaces = sorted(
+        namespace for namespace, count in Counter(namespaces).items() if count > 1
+    )
+    if duplicate_namespaces:
+        raise fail(
+            "INVALID_SKILL_ROOT",
+            "Skill root namespaces must be unique: " + ", ".join(duplicate_namespaces),
+        )
+    skills: list[Skill] = []
+    for configured_root in configured_roots:
         root = configured_root.path.expanduser()
         if not root.is_dir():
             continue
         resolved_root = root.resolve(strict=True)
         for entry in sorted(root.iterdir(), key=lambda item: item.name):
-            if entry.name in skills:
-                continue
             skill_file = entry / SKILL_FILE_NAME
             if not entry.is_dir() or not skill_file.is_file():
                 continue
@@ -155,14 +187,46 @@ def discover_skills(roots: Iterable[SkillRoot]) -> list[Skill]:
             location = f"{configured_root.source}:{entry.name}/{SKILL_FILE_NAME}"
             metadata = _parse_frontmatter(_read_frontmatter(resolved), entry.name, location)
             manifest = _read_manifest(skill_file.parent / SKILL_MANIFEST_NAME, location)
-            skills[entry.name] = Skill(
-                name=metadata["name"],
-                description=metadata["description"],
-                source=configured_root.source,
-                path=resolved,
-                manifest=manifest,
+            skills.append(
+                Skill(
+                    name=metadata["name"],
+                    description=metadata["description"],
+                    source=configured_root.source,
+                    path=resolved,
+                    manifest=manifest,
+                )
             )
-    return list(skills.values())
+    return skills
+
+
+def bind_trusted_skill_commands(
+    skills: Iterable[Skill],
+    configured: dict[str, dict[str, TrustedSkillCommandConfig]],
+) -> list[Skill]:
+    """Bind explicit host capabilities to exact namespaced Skills."""
+    values = list(skills)
+    by_id = {skill.id: skill for skill in values}
+    bound: dict[str, Skill] = {}
+    for skill_id, commands in configured.items():
+        skill = by_id.get(skill_id)
+        if skill is None:
+            raise fail(
+                "TRUSTED_SKILL_NOT_FOUND",
+                f"Trusted Skill command configuration references an unavailable Skill: {skill_id}",
+            )
+        collisions = sorted(set(commands) & set(skill.manifest.commands))
+        if collisions:
+            raise fail(
+                "SKILL_COMMAND_CONFLICT",
+                f"Trusted commands conflict with {skill_id} manifest commands: "
+                + ", ".join(collisions),
+            )
+        resolved_commands = {
+            name: _resolve_trusted_command(skill_id, name, command)
+            for name, command in commands.items()
+        }
+        bound[skill_id] = replace(skill, trusted_commands=resolved_commands)
+    return [bound.get(skill.id, skill) for skill in values]
 
 
 def format_skill_catalog(skills: Iterable[Skill]) -> str:
@@ -170,14 +234,25 @@ def format_skill_catalog(skills: Iterable[Skill]) -> str:
     entries = list(skills)
     if not entries:
         return ""
+    counts = Counter(skill.name for skill in entries)
+    defaults = {skill.name: skill.id for skill in reversed(entries)}
     lines = ["Available skills:"]
     for skill in entries:
         description = re.sub(r"\s+", " ", skill.description).strip()
         if len(description) > MAX_CATALOG_DESCRIPTION_CHARS:
             description = description[: MAX_CATALOG_DESCRIPTION_CHARS - 3] + "..."
         capability = " executable" if skill.has_executable_capabilities else ""
-        lines.append(f"- {skill.name} [{skill.source}{capability}]: {description}")
-        lines.append(f'  load with: load_skill("{skill.name}")')
+        if counts[skill.name] == 1:
+            display_name = skill.name
+            selector = skill.name
+            source = skill.source
+        else:
+            display_name = skill.id
+            selector = skill.id
+            default = ", default" if defaults[skill.name] == skill.id else ""
+            source = f"{skill.source}{default}"
+        lines.append(f"- {display_name} [{source}{capability}]: {description}")
+        lines.append(f'  load with: load_skill("{selector}")')
     return "\n".join(lines)
 
 
@@ -186,7 +261,12 @@ class SkillRegistry:
 
     def __init__(self, skills: Iterable[Skill], max_read_bytes: int) -> None:
         self.skills = list(skills)
-        self._by_name = {skill.name: skill for skill in self.skills}
+        self._by_id = {skill.id: skill for skill in self.skills}
+        if len(self._by_id) != len(self.skills):
+            raise fail("INVALID_SKILL", "Skill IDs must be unique within the registry.")
+        self._aliases: dict[str, Skill] = {}
+        for skill in reversed(self.skills):
+            self._aliases[skill.name] = skill
         self._max_read_bytes = max_read_bytes
 
         @tool
@@ -199,46 +279,159 @@ class SkillRegistry:
             except Exception as exc:
                 return {"ok": False, "error_code": "TOOL_ERROR", "message": str(exc)}
 
+        @tool
+        def load_skill_resource(skill_name: str, relative_path: str) -> dict[str, object]:
+            """Load one UTF-8 resource contained inside a registered Skill package."""
+            try:
+                return self.load_resource(skill_name, relative_path)
+            except CodingAgentError as exc:
+                return {"ok": False, "error_code": exc.code, "message": exc.user_message}
+            except Exception as exc:
+                return {"ok": False, "error_code": "TOOL_ERROR", "message": str(exc)}
+
         self.tool: BaseTool = load_skill
+        self.resource_tool: BaseTool = load_skill_resource
 
     def load(self, name: str) -> dict[str, object]:
         """Load one pre-discovered Skill without accepting a filesystem path."""
         skill = self.get(name)
-        try:
-            current_path = skill.path.resolve(strict=True)
-            if current_path != skill.path:
-                raise fail("SKILL_CHANGED", f"Skill path changed; restart required: {name}")
-            with current_path.open("rb") as file:
-                content = file.read(self._max_read_bytes + 1)
-        except CodingAgentError:
-            raise
-        except OSError as exc:
-            raise fail("SKILL_READ_ERROR", f"Cannot read Skill {name}: {exc}") from exc
-        if len(content) > self._max_read_bytes:
-            raise fail("SKILL_TOO_LARGE", f"Skill exceeds the read limit: {name}")
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise fail("INVALID_SKILL", f"Skill must be UTF-8 text: {name}") from exc
+        current_path = self._unchanged_skill_path(skill)
+        text = self._read_text(current_path, display_path=skill.id)
         return {
             "ok": True,
             "name": skill.name,
+            "skill_id": skill.id,
             "source": skill.source,
             "content": text,
             "requires_activation": skill.has_executable_capabilities,
             "commands": {
                 command_name: command.description
                 for command_name, command in skill.manifest.commands.items()
+            }
+            | {
+                command_name: command.description
+                for command_name, command in skill.trusted_commands.items()
             },
             "mcp_servers": sorted(skill.manifest.mcp_servers),
         }
 
+    def load_resource(self, name: str, relative_path: str) -> dict[str, object]:
+        """Read a bounded file without granting arbitrary host filesystem access."""
+        skill = self.get(name)
+        skill_path = self._unchanged_skill_path(skill)
+        requested = PurePosixPath(relative_path)
+        if (
+            not relative_path
+            or len(relative_path) > 2048
+            or requested.is_absolute()
+            or ".." in requested.parts
+            or "." in requested.parts
+        ):
+            raise fail(
+                "SKILL_RESOURCE_PATH_INVALID",
+                "Skill resource path must be a normalized relative path.",
+            )
+        root = skill_path.parent.resolve(strict=True)
+        try:
+            target = (root / Path(*requested.parts)).resolve(strict=True)
+        except OSError as exc:
+            raise fail(
+                "SKILL_RESOURCE_NOT_FOUND",
+                f"Cannot resolve Skill resource {skill.id}:{relative_path}: {exc}",
+            ) from exc
+        if not target.is_file() or not target.is_relative_to(root):
+            raise fail(
+                "SKILL_RESOURCE_OUTSIDE_ROOT",
+                f"Skill resource must stay inside {skill.id}.",
+            )
+        return {
+            "ok": True,
+            "name": skill.name,
+            "skill_id": skill.id,
+            "path": requested.as_posix(),
+            "content": self._read_text(
+                target,
+                display_path=f"{skill.id}:{requested.as_posix()}",
+            ),
+        }
+
     def get(self, name: str) -> Skill:
-        """Return one pre-discovered Skill or a stable user-facing error."""
-        skill = self._by_name.get(name)
+        """Resolve a namespaced ID or a precedence-compatible bare alias."""
+        skill = self._by_id.get(name) if ":" in name else self._aliases.get(name)
         if skill is None:
             raise fail("SKILL_NOT_FOUND", f"Skill is not available: {name}")
         return skill
+
+    @staticmethod
+    def _unchanged_skill_path(skill: Skill) -> Path:
+        try:
+            current_path = skill.path.resolve(strict=True)
+        except OSError as exc:
+            raise fail("SKILL_READ_ERROR", f"Cannot resolve Skill {skill.id}: {exc}") from exc
+        if current_path != skill.path:
+            raise fail("SKILL_CHANGED", f"Skill path changed; restart required: {skill.id}")
+        return current_path
+
+    def _read_text(self, path: Path, *, display_path: str) -> str:
+        try:
+            with path.open("rb") as file:
+                content = file.read(self._max_read_bytes + 1)
+        except OSError as exc:
+            raise fail(
+                "SKILL_READ_ERROR",
+                f"Cannot read Skill resource {display_path}: {exc}",
+            ) from exc
+        if len(content) > self._max_read_bytes:
+            raise fail("SKILL_TOO_LARGE", f"Skill resource exceeds the read limit: {display_path}")
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise fail(
+                "INVALID_SKILL",
+                f"Skill resource must be UTF-8 text: {display_path}",
+            ) from exc
+
+
+def _resolve_trusted_command(
+    skill_id: str,
+    name: str,
+    command: TrustedSkillCommandConfig,
+) -> TrustedSkillCommand:
+    executable = command.argv[0]
+    located = executable if Path(executable).is_absolute() else shutil.which(executable)
+    if located is None:
+        raise fail(
+            "TRUSTED_SKILL_EXECUTABLE_NOT_FOUND",
+            f"Cannot find executable for {skill_id}.{name}: {executable}",
+        )
+    try:
+        resolved = Path(located).resolve(strict=True)
+    except OSError as exc:
+        raise fail(
+            "TRUSTED_SKILL_EXECUTABLE_NOT_FOUND",
+            f"Cannot resolve executable for {skill_id}.{name}: {exc}",
+        ) from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise fail(
+            "TRUSTED_SKILL_EXECUTABLE_NOT_FOUND",
+            f"Executable is not a runnable file for {skill_id}.{name}: {resolved}",
+        )
+    return TrustedSkillCommand(
+        description=command.description,
+        argv=(str(resolved), *command.argv[1:]),
+        allow_args=command.allow_args,
+        timeout_seconds=command.timeout_seconds,
+        env_from_env=dict(command.env_from_env),
+        executable_digest=_sha256_file(resolved),
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_frontmatter(path: Path) -> str:

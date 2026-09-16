@@ -1196,6 +1196,7 @@ class SubagentDemoManager:
                 allowed_tool_names=frozenset(allowed_tools),
                 allowed_mcp_tool_names=frozenset(contract["mcp_tools"]),
                 role_instruction=role_instruction,
+                model_call_limit=config.subagent_model_call_limit,
             )
             try:
                 if not thread_initialized:

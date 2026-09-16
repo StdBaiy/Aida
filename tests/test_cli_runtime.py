@@ -32,6 +32,8 @@ def test_langsmith_is_disabled_without_credentials(tmp_path: Path, monkeypatch: 
 
     assert not config.langsmith_enabled
     assert config.max_parallel_sessions == 4
+    assert config.main_agent_model_call_limit == 20
+    assert config.subagent_model_call_limit == 20
     assert config.sandbox_provider == "seatbelt"
     assert config.sandbox_image is None
 
@@ -61,6 +63,73 @@ def test_docker_provider_remains_available_when_explicitly_configured() -> None:
     assert config.sandbox_image == "coding-agent-sandbox:local"
 
 
+def test_trusted_skill_commands_require_namespaced_skill_id() -> None:
+    try:
+        AgentConfig(
+            model="test-model",
+            api_key="model-key",
+            trusted_skill_commands={
+                "bytedcli": {
+                    "cli": {
+                        "description": "Run bytedcli.",
+                        "argv": ["bytedcli"],
+                    }
+                }
+            },
+        )
+    except ValueError as exc:
+        assert "namespaced Skill IDs" in str(exc)
+    else:
+        raise AssertionError("Trusted Skill command without a namespace must fail")
+
+
+def test_workspace_skill_cannot_receive_trusted_host_command() -> None:
+    try:
+        AgentConfig(
+            model="test-model",
+            api_key="model-key",
+            trusted_skill_commands={
+                "workspace:local": {
+                    "cli": {
+                        "description": "Run local command.",
+                        "argv": ["local-cli"],
+                    }
+                }
+            },
+        )
+    except ValueError as exc:
+        assert "Workspace Skills cannot receive" in str(exc)
+    else:
+        raise AssertionError("Workspace Skill host execution must fail")
+
+
+def test_trusted_skill_commands_load_from_config(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "model-key")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model": "test-model",
+                "trusted_skill_commands": {
+                    "user:bytedcli": {
+                        "cli": {
+                            "description": "Run bytedcli.",
+                            "argv": ["bytedcli"],
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    config = load_config(model=None, base_url=None, config_path=config_path)
+
+    assert config.trusted_skill_commands["user:bytedcli"]["cli"].argv == ["bytedcli"]
+
+
 def test_parallel_session_limit_can_be_configured_from_environment(
     tmp_path: Path,
     monkeypatch: Any,
@@ -75,6 +144,24 @@ def test_parallel_session_limit_can_be_configured_from_environment(
     )
 
     assert config.max_parallel_sessions == 7
+
+
+def test_model_call_limits_can_be_configured_from_environment(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "model-key")
+    monkeypatch.setenv("CODING_AGENT_MAIN_AGENT_MODEL_CALL_LIMIT", "31")
+    monkeypatch.setenv("CODING_AGENT_SUBAGENT_MODEL_CALL_LIMIT", "47")
+
+    config = load_config(
+        model="test-model",
+        base_url=None,
+        config_path=tmp_path / "missing.json",
+    )
+
+    assert config.main_agent_model_call_limit == 31
+    assert config.subagent_model_call_limit == 47
 
 
 def test_langsmith_can_be_explicitly_enabled(tmp_path: Path, monkeypatch: Any) -> None:
@@ -339,9 +426,11 @@ def test_browser_settings_persist_without_api_keys(tmp_path: Path) -> None:
         "command_timeout_seconds": 300,
         "langsmith_enabled": True,
         "langsmith_project": "next-project",
+        "main_agent_model_call_limit": 20,
         "max_parallel_sessions": 4,
         "model": "next-model",
         "model_timeout_seconds": 180,
         "other": "preserved",
+        "subagent_model_call_limit": 20,
     }
     assert path.stat().st_mode & 0o777 == 0o600

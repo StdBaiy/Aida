@@ -8,8 +8,8 @@
     {"id": "patch", "version": "1.0.0", "file": "patch.md", "tools": ["apply_patch"]},
     {"id": "background", "version": "1.0.0", "file": "background.md", "tools": ["inspect_tool_run", "wait_for_tools", "cancel_tool_run"]},
     {"id": "delegation", "version": "2.0.0", "file": "delegation.md", "tools": ["create_agent_tasks"]},
-    {"id": "skills", "version": "2.0.0", "file": "skills.md", "tools": ["load_skill"]},
-    {"id": "skill_execution", "version": "1.0.0", "file": "skill_execution.md", "tools": ["activate_skill", "run_skill_command", "call_skill_mcp"]},
+    {"id": "skills", "version": "2.1.0", "file": "skills.md", "tools": ["load_skill", "load_skill_resource"]},
+    {"id": "skill_execution", "version": "1.1.0", "file": "skill_execution.md", "tools": ["activate_skill", "run_skill_command", "call_skill_mcp"]},
     {"id": "mcp", "version": "2.0.0", "file": "mcp.md", "tools": ["activate_configured_mcp", "call_configured_mcp"]},
     {"id": "child", "version": "2.0.0", "file": "child.md", "tools": ["submit_agent_result"]}
   ]

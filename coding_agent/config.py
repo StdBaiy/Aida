@@ -37,6 +37,35 @@ class MCPServerConfig(BaseModel):
         return values
 
 
+class TrustedSkillCommandConfig(BaseModel):
+    """One user-configured host command bound to a namespaced Skill."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(min_length=1, max_length=500)
+    argv: list[str] = Field(min_length=1, max_length=64)
+    allow_args: bool = True
+    timeout_seconds: int = Field(default=120, ge=1, le=1800)
+    env_from_env: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("argv")
+    @classmethod
+    def validate_argv(cls, values: list[str]) -> list[str]:
+        if any(not value or any(char in value for char in "\x00\n\r") for value in values):
+            raise ValueError("command argv entries must be non-empty and contain no control chars")
+        return values
+
+    @field_validator("env_from_env")
+    @classmethod
+    def validate_environment_names(cls, values: dict[str, str]) -> dict[str, str]:
+        for target_name, source_name in values.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target_name):
+                raise ValueError(f"Invalid target environment variable: {target_name}")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", source_name):
+                raise ValueError(f"Invalid source environment variable: {source_name}")
+        return values
+
+
 class AgentConfig(BaseModel):
     """Validated runtime configuration."""
 
@@ -44,6 +73,8 @@ class AgentConfig(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model_timeout_seconds: int = Field(default=180, ge=1, le=1800)
+    main_agent_model_call_limit: int = Field(default=20, ge=1, le=200)
+    subagent_model_call_limit: int = Field(default=20, ge=1, le=200)
     command_timeout_seconds: int = Field(default=120, ge=1, le=1800)
     max_read_bytes: int = Field(default=1_048_576, ge=1024)
     max_command_output_bytes: int = Field(default=65_536, ge=1024)
@@ -54,6 +85,9 @@ class AgentConfig(BaseModel):
     langsmith_enabled: bool = False
     langsmith_project: str = "coding-agent-evaluation"
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    trusted_skill_commands: dict[str, dict[str, TrustedSkillCommandConfig]] = Field(
+        default_factory=dict
+    )
     sandbox_enabled: bool = True
     sandbox_provider: Literal["seatbelt", "docker"] = "seatbelt"
     sandbox_image: str | None = None
@@ -105,6 +139,41 @@ class AgentConfig(BaseModel):
                 f"letters, digits, underscores, or hyphens: {', '.join(sorted(invalid))}"
             )
         return servers
+
+    @field_validator("trusted_skill_commands")
+    @classmethod
+    def validate_trusted_skill_commands(
+        cls,
+        skills: dict[str, dict[str, TrustedSkillCommandConfig]],
+    ) -> dict[str, dict[str, TrustedSkillCommandConfig]]:
+        skill_id_pattern = r"[A-Za-z0-9_-]{1,64}:[A-Za-z0-9_-]{1,64}"
+        capability_pattern = r"[A-Za-z0-9_-]{1,64}"
+        invalid_skills = [
+            skill_id for skill_id in skills if not re.fullmatch(skill_id_pattern, skill_id)
+        ]
+        if invalid_skills:
+            raise ValueError(
+                "trusted_skill_commands keys must be namespaced Skill IDs: "
+                + ", ".join(sorted(invalid_skills))
+            )
+        workspace_skills = [skill_id for skill_id in skills if skill_id.startswith("workspace:")]
+        if workspace_skills:
+            raise ValueError(
+                "Workspace Skills cannot receive trusted host commands: "
+                + ", ".join(sorted(workspace_skills))
+            )
+        invalid_commands = [
+            f"{skill_id}:{command_name}"
+            for skill_id, commands in skills.items()
+            for command_name in commands
+            if not re.fullmatch(capability_pattern, command_name)
+        ]
+        if invalid_commands:
+            raise ValueError(
+                "Trusted Skill command names contain invalid characters: "
+                + ", ".join(sorted(invalid_commands))
+            )
+        return skills
 
     @model_validator(mode="after")
     def validate_credentials(self) -> AgentConfig:
@@ -171,6 +240,12 @@ def load_config(
         or raw.get("langsmith_project", "coding-agent-evaluation"),
         "max_parallel_sessions": os.getenv("CODING_AGENT_MAX_PARALLEL_SESSIONS")
         or raw.get("max_parallel_sessions", 4),
+        "main_agent_model_call_limit": os.getenv(
+            "CODING_AGENT_MAIN_AGENT_MODEL_CALL_LIMIT"
+        )
+        or raw.get("main_agent_model_call_limit", 20),
+        "subagent_model_call_limit": os.getenv("CODING_AGENT_SUBAGENT_MODEL_CALL_LIMIT")
+        or raw.get("subagent_model_call_limit", 20),
         "sandbox_enabled": os.getenv("CODING_AGENT_SANDBOX_ENABLED")
         or raw.get("sandbox_enabled", True),
         "sandbox_provider": os.getenv("CODING_AGENT_SANDBOX_PROVIDER")
@@ -200,6 +275,8 @@ def save_non_secret_config(config: AgentConfig, config_path: Path | None) -> Non
             "langsmith_enabled": config.langsmith_enabled,
             "langsmith_project": config.langsmith_project,
             "model_timeout_seconds": config.model_timeout_seconds,
+            "main_agent_model_call_limit": config.main_agent_model_call_limit,
+            "subagent_model_call_limit": config.subagent_model_call_limit,
             "command_timeout_seconds": config.command_timeout_seconds,
             "max_parallel_sessions": config.max_parallel_sessions,
         }

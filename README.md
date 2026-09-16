@@ -133,7 +133,7 @@ Server 名称会作为工具名前缀。首版仅支持 HTTP(S) Tools，不支�
 Prompts、OAuth 和 elicitation。MCP Server 必须视为受信配置；其工具产生的外部副作用
 不会随本地 Git snapshot 恢复。
 
-Skill 按以下优先级发现，同名时只使用优先级最高的版本：
+Skill 按以下优先级发现：
 
 ```text
 <workspace>/.agents/skills/<skill-name>/SKILL.md
@@ -143,10 +143,14 @@ Skill 按以下优先级发现，同名时只使用优先级最高的版本：
 
 `SKILL.md` 必须以 YAML 风格的 frontmatter 开头，声明与目录同名的 `name` 和非空
 `description`。Runtime 启动时只把名称、来源和描述加入系统提示词；当请求明确匹配
-描述时，Agent 才通过 `load_skill(name)` 工具加载完整内容。该工具只接受启动时完成
-校验和映射的 Skill 名称，不接受文件路径，因此不会放宽 `read_file` 的 workspace
-访问边界。Skill 不能覆盖系统安全规则或获得额外工具权限。新增 Skill 后需要重启
-Runtime 才能刷新目录和同名覆盖关系。
+描述时，Agent 才通过 `load_skill(name)` 工具加载完整内容。重名 Skill 会全部保留，
+可以使用 `workspace:name`、`user:name` 或 `codex:name` 精确加载；裸名称仍按上述
+优先级选择默认版本。
+
+`load_skill_resource(skill_name, relative_path)` 用于读取 Skill 包内引用的指南。路径
+必须位于已注册 Skill 目录内，不能访问任意宿主文件，因此不会放宽 `read_file` 的
+workspace 边界。Skill 不能覆盖系统安全规则或获得额外工具权限。新增 Skill 后需要
+重启 Runtime 才能刷新目录。
 
 需要执行能力的 Skill 在 `SKILL.md` 同目录增加 `skill.json`：
 
@@ -183,9 +187,30 @@ Runtime 才能刷新目录和同名覆盖关系。
 ```
 
 `script` 必须是 Skill 目录内的相对路径，并声明解释器；`argv` 用于固定 CLI 前缀，
-二者只能选一个。命令不经过 shell，并继续受 `CommandPolicy` 限制。环境变量配置只保存
-来源变量名，值在执行时读取且不会进入 manifest。Agent 首次调用 `activate_skill` 时
-请求用户授权，授权仅在当前 Runtime 的当前会话中复用；MCP 也只在授权后连接。
+二者只能选一个。manifest 命令不经过 shell，并继续在通用沙箱内运行。
+
+依赖宿主登录态和网络的可信 CLI 必须在用户配置中绑定完整 Skill ID：
+
+```json
+{
+  "trusted_skill_commands": {
+    "user:bytedcli": {
+      "cli": {
+        "description": "Run bytedcli with host credentials and network.",
+        "argv": ["bytedcli", "--no-auto-upgrade"],
+        "allow_args": true,
+        "timeout_seconds": 120
+      }
+    }
+  }
+}
+```
+
+可信命令固定 executable 前缀并直接使用 argv，不经过 shell；启动时锁定 executable
+路径和摘要，运行前再次校验。普通 `run_command` 不会因此获得宿主执行权限，也不会在
+沙箱失败后回退宿主机。环境变量配置只保存来源变量名，值在执行时读取且不会进入
+manifest。Agent 首次调用 `activate_skill` 时请求用户授权，授权按当前 Runtime、
+thread 和完整 Skill ID 隔离；MCP 也只在授权后连接。
 
 仓库提供 `.agents/skills/skill-smoke-test` 用于验证完整链路。先在一个终端启动它的
 本地 MCP Server：
@@ -294,6 +319,9 @@ tracer。导出失败不会影响已提交轮次，失败状态保存在本地�
 完成或取消。`max_parallel_tools` 和 `max_tool_scheduler_wakes` 可在配置文件中调整。
 Session operation 使用独立线程池执行，`max_parallel_sessions` 控制同一工作区的
 并行 session 数量，默认 4，也可在 Web Settings 中修改。超过上限的任务进入线程池队列。
+`main_agent_model_call_limit` 和 `subagent_model_call_limit` 分别限制主 Agent 与每个
+子 Agent 单次 graph run 的模型调用次数，默认均为 20，可在 Web Settings 中独立修改；
+它们不限制已持久化的历史对话轮数。
 Web 工作台通过可重放 SSE 为每个活跃 ToolRun 展示独立状态卡片。Session 侧栏和当前
 会话历史分别按 30 条分页；session 标题与轮数使用持久化摘要，旧数据只在进入对应分页时
 惰性回填，Host 启动仅查询最近一个 session。

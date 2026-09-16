@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-coding-agent"
+version = "0.1.0"
+description = "A local, checkpointed coding agent MVP"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "fastapi>=0.116,<1",
+    "fastmcp>=4.0.1,<5",
+    "langchain>=1.4.0,<2",
+    "langchain-openai>=1.0.0,<2",
+    "langgraph>=1.2.11,<2",
+    "langgraph-checkpoint-sqlite>=3.0.0,<4",
+    "langsmith>=0.3.45,<1",
+    "prompt-toolkit>=3.0.51,<4",
+    "pydantic>=2.7,<3",
+    "uvicorn>=0.35,<1",
+]
+
+[project.scripts]
+coding-agent = "coding_agent.cli:main"
+
+[dependency-groups]
+test = ["pytest>=8,<10"]
+lint = ["ruff>=0.15,<0.17", "mypy>=1.15,<2"]
+
+[tool.uv.sources]
+langchain = { path = "../../libs/langchain_v1", editable = true }
+langchain-openai = { path = "../../libs/partners/openai", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["coding_agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

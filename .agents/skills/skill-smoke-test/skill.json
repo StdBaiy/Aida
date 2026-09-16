@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "commands": {
+    "echo": {
+      "description": "Return the supplied arguments as structured JSON.",
+      "script": "scripts/echo.py",
+      "interpreter": "python3",
+      "allow_args": true,
+      "timeout_seconds": 30
+    }
+  },
+  "mcp_servers": {
+    "smoke": {
+      "url": "http://127.0.0.1:8877/mcp",
+      "timeout_seconds": 10
+    }
+  }
+}

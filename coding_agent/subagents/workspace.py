@@ -44,9 +44,11 @@ class SubagentWorkspaceManager:
         attempt_number: int,
         base_commit: str,
     ) -> tuple[Path, Path, str]:
+        del task_name
         worktree = self.worktrees_root / attempt_id
+        attempt_key = hashlib.sha256(attempt_id.encode()).hexdigest()[:12]
         branch = (
-            f"coding-agent/demo/{run_id[:8]}/{task_name.lower().replace(' ', '-')}"
+            f"coding-agent/demo/{run_id[:8]}/{attempt_key}"
             f"/attempt-{attempt_number}"
         )
         with self._git_lock:
@@ -151,6 +153,29 @@ class SubagentWorkspaceManager:
             )
             return result_commit
 
+    def patch_state(self, base_commit: str, result_commit: str) -> str:
+        """Classify an interrupted integration without mutating the workspace."""
+        with self._git_lock:
+            patch = self._result_patch(base_commit, result_commit)
+            if self._git_succeeds(
+                self.workspace.repo_root,
+                "apply",
+                "--reverse",
+                "--check",
+                "--whitespace=nowarn",
+                stdin=patch,
+            ):
+                return "applied"
+            if self._git_succeeds(
+                self.workspace.repo_root,
+                "apply",
+                "--check",
+                "--whitespace=nowarn",
+                stdin=patch,
+            ):
+                return "not_applied"
+            return "conflict"
+
     def _result_patch(self, base_commit: str, result_commit: str) -> bytes:
         patch = self._git_bytes(
             self.workspace.repo_root,
@@ -189,3 +214,18 @@ class SubagentWorkspaceManager:
             message = process.stderr.decode(errors="replace").strip()
             raise fail("SUBAGENT_GIT_ERROR", message or f"git {' '.join(args)} failed")
         return process.stdout
+
+    @staticmethod
+    def _git_succeeds(
+        cwd: Path,
+        *args: str,
+        stdin: bytes | None = None,
+    ) -> bool:
+        process = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            input=stdin,
+            capture_output=True,
+            check=False,
+            env=os.environ,
+        )
+        return process.returncode == 0

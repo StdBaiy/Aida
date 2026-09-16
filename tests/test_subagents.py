@@ -657,3 +657,314 @@ def test_restart_preserves_reviewable_child_and_requeues_claimed_wake(
         assert accepted["status"] == "merged"
     finally:
         recovered.close()
+
+
+def test_control_tools_reject_tasks_owned_by_another_session(tmp_path: Path) -> None:
+    root = repository(tmp_path)
+    manager = SubagentDemoManager(
+        resolve_workspace(root),
+        AgentConfig(model="test", api_key="test-key"),
+    )
+    run_id = manager.repository.create_run(
+        "session-a",
+        git(root, "rev-parse", "HEAD"),
+        expected_task_count=1,
+    )
+    task_id = manager.repository.create_task(
+        run_id=run_id,
+        session_id="session-a",
+        name="Private",
+        objective="inspect state",
+        output_path="README.md",
+        scope=["README.md"],
+        acceptance=["summary exists"],
+    )
+    tools = {item.name: item for item in manager.build_control_tools("session-b")}
+    try:
+        inspected = tools["inspect_agent_task"].invoke({"task_id": task_id})
+        cancelled = tools["cancel_agent_task"].invoke({"task_id": task_id})
+
+        assert inspected["error_code"] == "SUBAGENT_TASK_NOT_FOUND"
+        assert cancelled["error_code"] == "SUBAGENT_TASK_NOT_FOUND"
+        assert manager.repository.task(task_id)["status"] == "queued"
+    finally:
+        manager.close()
+
+
+def test_parent_wake_is_published_after_waiting_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = repository(tmp_path)
+    wake_seen = threading.Event()
+    observed_statuses: list[str] = []
+    holder: dict[str, SubagentDemoManager] = {}
+
+    class FakeChildRuntime:
+        def __init__(self, *, extra_tools: list[Any] | None = None, **_kwargs: Any) -> None:
+            self.extra_tools = extra_tools or []
+
+        def initialize_thread(self, _thread_id: str) -> str:
+            return "checkpoint"
+
+        def run_turn(self, **_kwargs: Any) -> tuple[str, str]:
+            request = next(
+                item for item in self.extra_tools if item.name == "request_parent_input"
+            )
+            request.invoke({"question": "Need input"})
+            return "waiting", "checkpoint"
+
+        def close(self) -> None:
+            pass
+
+    def on_wake(wake: dict[str, Any]) -> None:
+        observed_statuses.append(
+            str(holder["manager"].repository.task(str(wake["task_id"]))["status"])
+        )
+        wake_seen.set()
+
+    monkeypatch.setattr("coding_agent.runtime.AgentRuntime", FakeChildRuntime)
+    manager = SubagentDemoManager(
+        resolve_workspace(root),
+        AgentConfig(model="test", api_key="test-key"),
+        on_wake=on_wake,
+    )
+    holder["manager"] = manager
+    manager.bind_session("session-1")
+    try:
+        manager.create_agent_task(
+            name="Needs input",
+            objective="ask parent",
+            scope=["README.md"],
+            acceptance=["question sent"],
+            allowed_tools=["read_file"],
+            workspace_mode="none",
+        )
+        assert wake_seen.wait(timeout=5)
+        assert observed_statuses == ["waiting_parent"]
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    ("task_status", "expected_run_status"),
+    [("merged", "completed"), ("cancelled", "cancelled")],
+)
+def test_restart_reconciles_terminal_task_run(
+    tmp_path: Path,
+    task_status: str,
+    expected_run_status: str,
+) -> None:
+    root = repository(tmp_path)
+    workspace = resolve_workspace(root)
+    manager = SubagentDemoManager(workspace)
+    run_id = manager.repository.create_run(
+        "session-1",
+        git(root, "rev-parse", "HEAD"),
+        expected_task_count=1,
+    )
+    task_id = manager.repository.create_task(
+        run_id=run_id,
+        session_id="session-1",
+        name="Terminal",
+        objective="finish",
+        output_path="README.md",
+    )
+    manager.repository.update_task(task_id, status=task_status)
+    manager.repository.set_run_status(run_id, "running")
+    manager.close()
+
+    recovered = SubagentDemoManager(workspace)
+    try:
+        assert recovered.repository.run(run_id)["status"] == expected_run_status
+        assert recovered.repository.active_run("session-1") is None
+    finally:
+        recovered.close()
+
+
+def test_revision_transition_never_exposes_rejected_attempt_as_reviewable(
+    tmp_path: Path,
+) -> None:
+    root = repository(tmp_path)
+    workspace = resolve_workspace(root)
+    manager = SubagentDemoManager(workspace)
+    base_commit = git(root, "rev-parse", "HEAD")
+    run_id = manager.repository.create_run(
+        "session-1",
+        base_commit,
+        expected_task_count=1,
+    )
+    task_id = manager.repository.create_task(
+        run_id=run_id,
+        session_id="session-1",
+        name="Revision",
+        objective="revise",
+        output_path="README.md",
+    )
+    previous_id = manager.repository.create_attempt(
+        task_id=task_id,
+        attempt_number=1,
+        base_commit=base_commit,
+        allowed_tools=("read_file",),
+        workspace_mode="none",
+    )
+    manager.repository.update_attempt(previous_id, status="completed")
+    manager.repository.update_task(task_id, status="awaiting_review")
+
+    next_id = manager.repository.create_revision_attempt(
+        task_id=task_id,
+        previous_attempt_id=previous_id,
+        attempt_number=2,
+        base_commit=base_commit,
+        allowed_tools=("read_file",),
+        workspace_mode="none",
+        feedback="revise",
+    )
+    assert next_id is not None
+    manager.close()
+
+    recovered = SubagentDemoManager(workspace)
+    try:
+        task = recovered.repository.task(task_id)
+        assert task["active_attempt_id"] == next_id
+        assert task["status"] == "failed"
+        assert recovered.repository.attempt(previous_id)["status"] == "rejected"
+    finally:
+        recovered.close()
+
+
+def test_restart_completes_integration_applied_before_state_commit(
+    tmp_path: Path,
+) -> None:
+    root = repository(tmp_path)
+    workspace = resolve_workspace(root)
+    manager = SubagentDemoManager(workspace)
+    base_commit = git(root, "rev-parse", "HEAD")
+    run_id = manager.repository.create_run(
+        "session-1",
+        base_commit,
+        expected_task_count=1,
+    )
+    task_id = manager.repository.create_task(
+        run_id=run_id,
+        session_id="session-1",
+        name="Integration",
+        objective="write result",
+        output_path="result.txt",
+        scope=["result.txt"],
+        acceptance=["result exists"],
+    )
+    attempt_id = manager.repository.create_attempt(
+        task_id=task_id,
+        attempt_number=1,
+        base_commit=base_commit,
+        allowed_tools=("apply_patch",),
+    )
+    worktree, attempt_workspace, _branch = manager.workspaces.create_attempt(
+        run_id=run_id,
+        task_name="Integration",
+        attempt_id=attempt_id,
+        attempt_number=1,
+        base_commit=base_commit,
+    )
+    (attempt_workspace / "result.txt").write_text("done")
+    result_commit = manager.workspaces.commit(worktree, message="result")
+    manager.repository.update_attempt(
+        attempt_id,
+        status="completed",
+        result_commit=result_commit,
+        worktree_path=str(worktree),
+    )
+    manager.repository.update_task(task_id, status="integrating")
+    manager.repository.set_run_status(run_id, "running")
+    manager.workspaces.apply_to_parent(base_commit, result_commit)
+    manager.close()
+
+    recovered = SubagentDemoManager(workspace)
+    try:
+        task = recovered.repository.task(task_id)
+        assert task["status"] == "merged"
+        assert task["integration_commit"] == result_commit
+        assert recovered.repository.run(run_id)["status"] == "completed"
+        assert (root / "result.txt").read_text() == "done"
+    finally:
+        recovered.close()
+
+
+def test_restart_returns_unapplied_integration_to_review(tmp_path: Path) -> None:
+    root = repository(tmp_path)
+    workspace = resolve_workspace(root)
+    manager = SubagentDemoManager(workspace)
+    base_commit = git(root, "rev-parse", "HEAD")
+    run_id = manager.repository.create_run(
+        "session-1",
+        base_commit,
+        expected_task_count=1,
+    )
+    task_id = manager.repository.create_task(
+        run_id=run_id,
+        session_id="session-1",
+        name="Integration",
+        objective="write result",
+        output_path="result.txt",
+        scope=["result.txt"],
+        acceptance=["result exists"],
+    )
+    attempt_id = manager.repository.create_attempt(
+        task_id=task_id,
+        attempt_number=1,
+        base_commit=base_commit,
+        allowed_tools=("apply_patch",),
+    )
+    worktree, attempt_workspace, _branch = manager.workspaces.create_attempt(
+        run_id=run_id,
+        task_name="Integration",
+        attempt_id=attempt_id,
+        attempt_number=1,
+        base_commit=base_commit,
+    )
+    (attempt_workspace / "result.txt").write_text("done")
+    result_commit = manager.workspaces.commit(worktree, message="result")
+    manager.repository.update_attempt(
+        attempt_id,
+        status="completed",
+        result_commit=result_commit,
+        worktree_path=str(worktree),
+    )
+    manager.repository.update_task(task_id, status="integrating")
+    manager.repository.set_run_status(run_id, "running")
+    manager.close()
+
+    recovered = SubagentDemoManager(workspace)
+    try:
+        assert recovered.repository.task(task_id)["status"] == "awaiting_review"
+        accepted = recovered.accept_result(task_id)
+        assert accepted["status"] == "merged"
+        assert (root / "result.txt").read_text() == "done"
+    finally:
+        recovered.close()
+
+
+def test_same_name_tasks_use_distinct_worktree_branches(tmp_path: Path) -> None:
+    root = repository(tmp_path)
+    manager = SubagentDemoManager(resolve_workspace(root))
+    base_commit = git(root, "rev-parse", "HEAD")
+    try:
+        first = manager.workspaces.create_attempt(
+            run_id="run-12345678",
+            task_name="Same",
+            attempt_id="attempt-11111111",
+            attempt_number=1,
+            base_commit=base_commit,
+        )
+        second = manager.workspaces.create_attempt(
+            run_id="run-12345678",
+            task_name="Same",
+            attempt_id="attempt-22222222",
+            attempt_number=1,
+            base_commit=base_commit,
+        )
+
+        assert first[2] != second[2]
+    finally:
+        manager.close()

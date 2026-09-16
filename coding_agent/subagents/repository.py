@@ -91,6 +91,10 @@ ON agent_wake_requests(parent_session_id, status, priority, created_at);
 _ACTIVE_RUN_STATUSES = ("queued", "running")
 
 
+class _TransitionConflict(RuntimeError):
+    pass
+
+
 class SubagentRepository:
     """Thread-safe repository for demo runs, tasks, attempts, and events."""
 
@@ -142,8 +146,8 @@ class SubagentRepository:
             self.connection.execute(
                 """
                 UPDATE subagent_tasks
-                SET status = 'awaiting_review', updated_at = ?
-                WHERE status IN ('integrating', 'revision_required')
+                SET status = 'failed', updated_at = ?
+                WHERE status = 'revision_required'
                 """,
                 (now,),
             )
@@ -172,6 +176,45 @@ class SubagentRepository:
                             'awaiting_review', 'revision_required',
                             'waiting_parent', 'waiting_capability'
                         )
+                  )
+                """,
+                (now,),
+            )
+            self.connection.execute(
+                """
+                UPDATE subagent_demo_runs
+                SET status = 'cancelled', ended_at = ?
+                WHERE status IN ('queued', 'running')
+                  AND (
+                      SELECT COUNT(*) FROM subagent_tasks
+                      WHERE subagent_tasks.run_id = subagent_demo_runs.run_id
+                  ) = expected_task_count
+                  AND NOT EXISTS (
+                      SELECT 1 FROM subagent_tasks
+                      WHERE subagent_tasks.run_id = subagent_demo_runs.run_id
+                        AND subagent_tasks.status NOT IN ('merged', 'cancelled')
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM subagent_tasks
+                      WHERE subagent_tasks.run_id = subagent_demo_runs.run_id
+                        AND subagent_tasks.status = 'cancelled'
+                  )
+                """,
+                (now,),
+            )
+            self.connection.execute(
+                """
+                UPDATE subagent_demo_runs
+                SET status = 'completed', ended_at = ?
+                WHERE status IN ('queued', 'running')
+                  AND (
+                      SELECT COUNT(*) FROM subagent_tasks
+                      WHERE subagent_tasks.run_id = subagent_demo_runs.run_id
+                  ) = expected_task_count
+                  AND NOT EXISTS (
+                      SELECT 1 FROM subagent_tasks
+                      WHERE subagent_tasks.run_id = subagent_demo_runs.run_id
+                        AND subagent_tasks.status != 'merged'
                   )
                 """,
                 (now,),
@@ -444,6 +487,211 @@ class SubagentRepository:
                 (attempt_id, utc_now().isoformat(), task_id),
             )
         return attempt_id
+
+    def create_revision_attempt(
+        self,
+        *,
+        task_id: str,
+        previous_attempt_id: str,
+        attempt_number: int,
+        base_commit: str,
+        allowed_tools: tuple[str, ...],
+        workspace_mode: str,
+        feedback: str,
+    ) -> str | None:
+        """Atomically replace one reviewable attempt with its revision."""
+        attempt_id = new_id()
+        now = utc_now().isoformat()
+        try:
+            with self._lock, self.connection:
+                previous = self.connection.execute(
+                    """
+                    UPDATE subagent_attempts
+                    SET status = 'rejected'
+                    WHERE attempt_id = ? AND task_id = ? AND status = 'completed'
+                    """,
+                    (previous_attempt_id, task_id),
+                )
+                if previous.rowcount != 1:
+                    raise _TransitionConflict
+                self.connection.execute(
+                    """
+                    INSERT INTO subagent_attempts (
+                        attempt_id, task_id, attempt_number, status, base_commit,
+                        result_commit, worktree_path, allowed_tools_json,
+                        started_at, ended_at, error, result_envelope_json,
+                        workspace_mode, workspace_state, thread_id, checkpoint_id
+                    ) VALUES (
+                        ?, ?, ?, 'queued', ?, NULL, NULL, ?, NULL, NULL, NULL, NULL,
+                        ?, 'unallocated', NULL, NULL
+                    )
+                    """,
+                    (
+                        attempt_id,
+                        task_id,
+                        attempt_number,
+                        base_commit,
+                        json.dumps(allowed_tools),
+                        workspace_mode,
+                    ),
+                )
+                task = self.connection.execute(
+                    """
+                    UPDATE subagent_tasks
+                    SET active_attempt_id = ?, status = 'running', feedback = ?,
+                        updated_at = ?
+                    WHERE task_id = ? AND active_attempt_id = ?
+                      AND status = 'awaiting_review'
+                    """,
+                    (attempt_id, feedback, now, task_id, previous_attempt_id),
+                )
+                if task.rowcount != 1:
+                    raise _TransitionConflict
+        except _TransitionConflict:
+            return None
+        return attempt_id
+
+    def pause_for_parent(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt_id: str,
+        status: str,
+        event_type: str,
+        payload: dict[str, Any],
+        wake_type: str,
+        wake_priority: int,
+    ) -> int | None:
+        """Atomically publish a parent request after the child turn has stopped."""
+        now = utc_now().isoformat()
+        try:
+            with self._lock, self.connection:
+                attempt = self.connection.execute(
+                    """
+                    UPDATE subagent_attempts SET status = ?
+                    WHERE attempt_id = ? AND task_id = ? AND status = 'running'
+                    """,
+                    (status, attempt_id, task_id),
+                )
+                if attempt.rowcount != 1:
+                    raise _TransitionConflict
+                task = self.connection.execute(
+                    """
+                    UPDATE subagent_tasks SET status = ?, updated_at = ?
+                    WHERE task_id = ? AND run_id = ? AND active_attempt_id = ?
+                      AND status = 'running'
+                    """,
+                    (status, now, task_id, run_id, attempt_id),
+                )
+                if task.rowcount != 1:
+                    raise _TransitionConflict
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO subagent_events (
+                        run_id, task_id, attempt_id, event_type, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        task_id,
+                        attempt_id,
+                        event_type,
+                        json.dumps(payload, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                event_id = cursor.lastrowid
+                if event_id is None:
+                    raise RuntimeError("SQLite did not return an event ID.")
+                session = self.connection.execute(
+                    "SELECT session_id FROM subagent_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if session is None:
+                    raise KeyError(task_id)
+                self.connection.execute(
+                    """
+                    INSERT INTO agent_wake_requests (
+                        wake_id, parent_session_id, task_id, attempt_id, event_id,
+                        wake_type, priority, payload_json, status, dedupe_key,
+                        created_at, claimed_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)
+                    """,
+                    (
+                        new_id(),
+                        str(session["session_id"]),
+                        task_id,
+                        attempt_id,
+                        event_id,
+                        wake_type,
+                        wake_priority,
+                        json.dumps(payload, ensure_ascii=False),
+                        f"{session['session_id']}:{event_id}:{wake_type}",
+                        now,
+                    ),
+                )
+                return int(event_id)
+        except _TransitionConflict:
+            return None
+
+    def integrating_tasks(self) -> list[dict[str, Any]]:
+        """Return integrations whose filesystem/SQLite commit needs reconciliation."""
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT t.*, a.base_commit, a.result_commit, a.status AS attempt_status
+                FROM subagent_tasks t
+                JOIN subagent_attempts a ON a.attempt_id = t.active_attempt_id
+                WHERE t.status = 'integrating'
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def complete_integration(
+        self,
+        task_id: str,
+        attempt_id: str,
+        integration_commit: str,
+    ) -> bool:
+        """Atomically persist a completed filesystem integration."""
+        now = utc_now().isoformat()
+        try:
+            with self._lock, self.connection:
+                attempt = self.connection.execute(
+                    """
+                    UPDATE subagent_attempts SET status = 'accepted', ended_at = ?
+                    WHERE attempt_id = ? AND task_id = ?
+                      AND status IN ('completed', 'accepted')
+                    """,
+                    (now, attempt_id, task_id),
+                )
+                if attempt.rowcount != 1:
+                    raise _TransitionConflict
+                task = self.connection.execute(
+                    """
+                    UPDATE subagent_tasks
+                    SET status = 'merged', accepted_attempt_id = ?,
+                        integration_commit = ?, updated_at = ?
+                    WHERE task_id = ? AND active_attempt_id = ?
+                      AND status = 'integrating'
+                    """,
+                    (attempt_id, integration_commit, now, task_id, attempt_id),
+                )
+                if task.rowcount != 1:
+                    raise _TransitionConflict
+        except _TransitionConflict:
+            return False
+        return True
+
+    def reset_integration(self, task_id: str, attempt_id: str) -> bool:
+        """Return an unapplied interrupted integration to review."""
+        return self.transition_task(
+            task_id,
+            ("integrating",),
+            status="awaiting_review",
+            active_attempt_id=attempt_id,
+        )
 
     def update_attempt(self, attempt_id: str, **values: Any) -> None:
         if not values:

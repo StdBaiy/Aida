@@ -71,6 +71,7 @@ class SubagentDemoManager:
         self._on_wake = on_wake
         self._trace_store = trace_store
         self._trace_exporter = trace_exporter
+        self._recover_integrations()
         self._restore_contracts()
 
     def _restore_contracts(self) -> None:
@@ -88,12 +89,92 @@ class SubagentDemoManager:
                 }
             )
 
+    def _recover_integrations(self) -> None:
+        """Reconcile filesystem writes left between apply and SQLite commit."""
+        for task in self.repository.integrating_tasks():
+            task_id = str(task["task_id"])
+            run_id = str(task["run_id"])
+            attempt_id = str(task["active_attempt_id"])
+            base_commit = str(task["base_commit"])
+            result_commit = task.get("result_commit")
+            if not result_commit:
+                self._fail_task(
+                    run_id,
+                    task_id,
+                    fail(
+                        "SUBAGENT_INTEGRATION_RECOVERY_FAILED",
+                        "Interrupted integration has no result commit.",
+                    ),
+                )
+                self._finish_run_if_ready(run_id)
+                continue
+            state = self.workspaces.patch_state(base_commit, str(result_commit))
+            if state == "applied":
+                if not self.repository.complete_integration(
+                    task_id,
+                    attempt_id,
+                    str(result_commit),
+                ):
+                    continue
+                self._event(
+                    run_id,
+                    task_id,
+                    attempt_id,
+                    "integration.completed",
+                    {
+                        "integration_commit": result_commit,
+                        "target": "parent workspace",
+                        "recovered": True,
+                    },
+                )
+                self._finish_run_if_ready(run_id)
+            elif state == "not_applied":
+                if self.repository.reset_integration(task_id, attempt_id):
+                    self._event(
+                        run_id,
+                        task_id,
+                        attempt_id,
+                        "result.committed",
+                        {
+                            "result_commit": result_commit,
+                            "changed_paths": [],
+                            "recovered": True,
+                        },
+                    )
+            else:
+                self._fail_task(
+                    run_id,
+                    task_id,
+                    fail(
+                        "SUBAGENT_INTEGRATION_RECOVERY_FAILED",
+                        "Interrupted integration conflicts with the parent workspace.",
+                    ),
+                )
+                self._finish_run_if_ready(run_id)
+
+    def _task_for_session(
+        self,
+        task_id: str,
+        expected_session_id: str | None,
+    ) -> dict[str, Any]:
+        try:
+            task = self.repository.task(task_id)
+        except KeyError as exc:
+            raise fail("SUBAGENT_TASK_NOT_FOUND", "Unknown child task.") from exc
+        if (
+            expected_session_id is not None
+            and str(task["session_id"]) != expected_session_id
+        ):
+            raise fail("SUBAGENT_TASK_NOT_FOUND", "Unknown child task.")
+        return task
+
     def bind_session(self, session_id: str) -> None:
         """Bind parent-facing tools to the currently active session."""
         self._session_id = session_id
 
     def build_control_tools(self, session_id: str | None = None) -> list[BaseTool]:
         """Build the capability surface exposed only to the main Agent."""
+        owner_session_id = session_id or self._session_id
 
         @tool
         def create_agent_tasks(
@@ -109,7 +190,7 @@ class SubagentDemoManager:
         def inspect_agent_task(task_id: str, after_event_id: int = 0) -> dict[str, Any]:
             """Inspect one child Agent and return incremental progress and result evidence."""
             try:
-                task = self.repository.task(task_id)
+                task = self._task_for_session(task_id, owner_session_id)
                 run = self.repository.run(str(task["run_id"]))
                 item = next(value for value in run["tasks"] if value["task_id"] == task_id)
                 item["events"] = [
@@ -124,14 +205,20 @@ class SubagentDemoManager:
             """Wait until any child is reviewable or terminal, then return all statuses."""
             try:
                 deadline = time.monotonic() + min(max(timeout_seconds, 1), 15)
-                initial = [self.repository.task(task_id) for task_id in task_ids]
+                initial = [
+                    self._task_for_session(task_id, owner_session_id)
+                    for task_id in task_ids
+                ]
                 active_ids = {
                     str(task["task_id"])
                     for task in initial
                     if task["status"] in {"queued", "running", "cancelling"}
                 }
                 while time.monotonic() < deadline:
-                    tasks = [self.repository.task(task_id) for task_id in task_ids]
+                    tasks = [
+                        self._task_for_session(task_id, owner_session_id)
+                        for task_id in task_ids
+                    ]
                     if any(
                         str(task["task_id"]) in active_ids
                         and task["status"] not in {"queued", "running", "cancelling"}
@@ -149,7 +236,10 @@ class SubagentDemoManager:
                             "status": task["status"],
                             "active_attempt_id": task["active_attempt_id"],
                         }
-                        for task in (self.repository.task(task_id) for task_id in task_ids)
+                        for task in (
+                            self._task_for_session(task_id, owner_session_id)
+                            for task_id in task_ids
+                        )
                     ],
                 }
             except Exception as exc:
@@ -159,7 +249,11 @@ class SubagentDemoManager:
         def request_agent_revision(task_id: str, feedback: str) -> dict[str, Any]:
             """Start a new Attempt from a completed child result with review feedback."""
             try:
-                return self.request_revision(task_id, feedback)
+                return self.request_revision(
+                    task_id,
+                    feedback,
+                    expected_session_id=owner_session_id,
+                )
             except Exception as exc:
                 return self._tool_error(exc)
 
@@ -168,7 +262,7 @@ class SubagentDemoManager:
             """Accept a completed child result and apply it to the parent workspace."""
             try:
                 acquire_workspace_mutation()
-                return self.accept_result(task_id)
+                return self.accept_result(task_id, expected_session_id=owner_session_id)
             except Exception as exc:
                 return self._tool_error(exc)
 
@@ -176,7 +270,7 @@ class SubagentDemoManager:
         def cancel_agent_task(task_id: str) -> dict[str, Any]:
             """Cancel one queued, running, or review-pending child Agent task."""
             try:
-                return self.cancel_task(task_id)
+                return self.cancel_task(task_id, expected_session_id=owner_session_id)
             except Exception as exc:
                 return self._tool_error(exc)
 
@@ -184,7 +278,11 @@ class SubagentDemoManager:
         def respond_agent_request(task_id: str, response: str) -> dict[str, Any]:
             """Resume a child Agent that is waiting for information from its parent."""
             try:
-                return self.respond_to_request(task_id, response)
+                return self.respond_to_request(
+                    task_id,
+                    response,
+                    expected_session_id=owner_session_id,
+                )
             except Exception as exc:
                 return self._tool_error(exc)
 
@@ -196,7 +294,12 @@ class SubagentDemoManager:
         ) -> dict[str, Any]:
             """Grant requested local or mcp:<tool> capabilities, then resume the child."""
             try:
-                return self.grant_capabilities(task_id, tools, response)
+                return self.grant_capabilities(
+                    task_id,
+                    tools,
+                    response,
+                    expected_session_id=owner_session_id,
+                )
             except Exception as exc:
                 return self._tool_error(exc)
 
@@ -445,10 +548,15 @@ class SubagentDemoManager:
 
         future.add_done_callback(settled)
 
-    def cancel_task(self, task_id: str) -> dict[str, Any]:
+    def cancel_task(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Request cancellation for one task without affecting sibling tasks."""
         with self._lock:
-            task = self.repository.task(task_id)
+            task = self._task_for_session(task_id, expected_session_id)
             status = str(task["status"])
             if status in _TERMINAL_TASKS:
                 return {"ok": True, "task_id": task_id, "status": status}
@@ -488,45 +596,71 @@ class SubagentDemoManager:
             )
             return {"ok": True, "task_id": task_id, "status": "cancelling"}
 
-    def respond_to_request(self, task_id: str, response: str) -> dict[str, Any]:
+    def respond_to_request(
+        self,
+        task_id: str,
+        response: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Resume a child paused on an explicit parent-information request."""
-        return self._resume_waiting_task(task_id, response=response)
+        return self._resume_waiting_task(
+            task_id,
+            response=response,
+            expected_session_id=expected_session_id,
+        )
 
     def grant_capabilities(
         self,
         task_id: str,
         tools: list[str],
         response: str,
+        *,
+        expected_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate a capability delta against the parent catalog and resume."""
-        task = self.repository.task(task_id)
-        contract = self._contracts.get(task_id)
-        if contract is None:
-            raise fail("SUBAGENT_CONTEXT_MISSING", "The child task contract is unavailable.")
-        candidate = self._normalize_contract(
-            {
-                **contract,
-                "allowed_tools": [*contract["allowed_tools"], *tools],
-            }
-        )
-        self._contracts[task_id] = candidate
-        attempt_id = str(task["active_attempt_id"])
-        self.repository.update_attempt(
-            attempt_id,
-            allowed_tools_json=json.dumps(candidate["allowed_tools"]),
-        )
-        self._event(
-            str(task["run_id"]),
-            task_id,
-            attempt_id,
-            "capability.granted",
-            {"tools": tools, "response": response},
-        )
-        return self._resume_waiting_task(task_id, response=response)
-
-    def _resume_waiting_task(self, task_id: str, *, response: str) -> dict[str, Any]:
         with self._lock:
-            task = self.repository.task(task_id)
+            task = self._task_for_session(task_id, expected_session_id)
+            contract = self._contracts.get(task_id)
+            if contract is None:
+                raise fail(
+                    "SUBAGENT_CONTEXT_MISSING",
+                    "The child task contract is unavailable.",
+                )
+            candidate = self._normalize_contract(
+                {
+                    **contract,
+                    "allowed_tools": [*contract["allowed_tools"], *tools],
+                }
+            )
+            self._contracts[task_id] = candidate
+            attempt_id = str(task["active_attempt_id"])
+            self.repository.update_attempt(
+                attempt_id,
+                allowed_tools_json=json.dumps(candidate["allowed_tools"]),
+            )
+            self._event(
+                str(task["run_id"]),
+                task_id,
+                attempt_id,
+                "capability.granted",
+                {"tools": tools, "response": response},
+            )
+            return self._resume_waiting_task(
+                task_id,
+                response=response,
+                expected_session_id=expected_session_id,
+            )
+
+    def _resume_waiting_task(
+        self,
+        task_id: str,
+        *,
+        response: str,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            task = self._task_for_session(task_id, expected_session_id)
             if task["status"] not in {"waiting_parent", "waiting_capability"}:
                 raise fail(
                     "SUBAGENT_NOT_WAITING",
@@ -647,67 +781,87 @@ class SubagentDemoManager:
         except KeyError as exc:
             raise fail("SUBAGENT_DEMO_NOT_FOUND", f"Unknown demo run: {run_id}") from exc
 
-    def request_revision(self, task_id: str, feedback: str) -> dict[str, Any]:
+    def request_revision(
+        self,
+        task_id: str,
+        feedback: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Reject the current result and start a new Attempt from its commit."""
-        task = self.repository.task(task_id)
-        if task["status"] != "awaiting_review":
-            raise fail("SUBAGENT_NOT_REVIEWABLE", "Only a completed child task can be revised.")
-        self.repository.complete_task_wakes(task_id)
-        previous_attempt_id = str(task["active_attempt_id"])
-        previous = self.repository.attempt(previous_attempt_id)
-        contract = self._contracts.get(task_id)
-        if contract is None:
-            raise fail(
-                "SUBAGENT_CONTEXT_MISSING",
-                "The task context is unavailable after a Host restart.",
+        with self._lock:
+            task = self._task_for_session(task_id, expected_session_id)
+            if task["status"] != "awaiting_review":
+                raise fail(
+                    "SUBAGENT_NOT_REVIEWABLE",
+                    "Only a completed child task can be revised.",
+                )
+            previous_attempt_id = str(task["active_attempt_id"])
+            previous = self.repository.attempt(previous_attempt_id)
+            contract = self._contracts.get(task_id)
+            if contract is None:
+                raise fail(
+                    "SUBAGENT_CONTEXT_MISSING",
+                    "The task context is unavailable after a Host restart.",
+                )
+            attempt_number = int(previous["attempt_number"]) + 1
+            if attempt_number > 3:
+                raise fail(
+                    "SUBAGENT_ATTEMPTS_EXHAUSTED",
+                    "The task reached its Attempt limit.",
+                )
+            base_commit = str(previous["result_commit"] or previous["base_commit"])
+            attempt_id = self.repository.create_revision_attempt(
+                task_id=task_id,
+                previous_attempt_id=previous_attempt_id,
+                attempt_number=attempt_number,
+                base_commit=base_commit,
+                allowed_tools=tuple(contract["allowed_tools"]),
+                workspace_mode=contract["workspace_mode"],
+                feedback=feedback,
             )
-        attempt_number = int(previous["attempt_number"]) + 1
-        if attempt_number > 3:
-            raise fail("SUBAGENT_ATTEMPTS_EXHAUSTED", "The task reached its Attempt limit.")
-        self.repository.update_attempt(previous_attempt_id, status="rejected")
-        self.repository.update_task(
-            task_id,
-            status="revision_required",
-            feedback=feedback,
-        )
-        self._event(
-            str(task["run_id"]),
-            task_id,
-            previous_attempt_id,
-            "parent.feedback",
-            {"decision": "REVISE", "message": feedback},
-        )
-        attempt_id = self.repository.create_attempt(
-            task_id=task_id,
-            attempt_number=attempt_number,
-            base_commit=str(previous["result_commit"] or previous["base_commit"]),
-            allowed_tools=tuple(contract["allowed_tools"]),
-            workspace_mode=contract["workspace_mode"],
-        )
-        self._event(
-            str(task["run_id"]),
-            task_id,
-            attempt_id,
-            "attempt.queued",
-            {
-                "attempt_number": attempt_number,
-                "allowed_tools": contract["allowed_tools"],
-                "base_commit": previous["result_commit"] or previous["base_commit"],
-                "reason": feedback,
-            },
-        )
-        self._submit_agent_attempt(str(task["run_id"]), task_id, attempt_id)
-        return {
-            "ok": True,
-            "task_id": task_id,
-            "attempt_id": attempt_id,
-            "status": "queued",
-        }
+            if attempt_id is None:
+                raise fail(
+                    "SUBAGENT_STATE_CHANGED",
+                    "The child task state already changed.",
+                )
+            self.repository.complete_task_wakes(task_id)
+            self._event(
+                str(task["run_id"]),
+                task_id,
+                previous_attempt_id,
+                "parent.feedback",
+                {"decision": "REVISE", "message": feedback},
+            )
+            self._event(
+                str(task["run_id"]),
+                task_id,
+                attempt_id,
+                "attempt.queued",
+                {
+                    "attempt_number": attempt_number,
+                    "allowed_tools": contract["allowed_tools"],
+                    "base_commit": base_commit,
+                    "reason": feedback,
+                },
+            )
+            self._submit_agent_attempt(str(task["run_id"]), task_id, attempt_id)
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "status": "queued",
+            }
 
-    def accept_result(self, task_id: str) -> dict[str, Any]:
+    def accept_result(
+        self,
+        task_id: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Apply a reviewed child result to the parent workspace."""
         with self._lock:
-            task = self.repository.task(task_id)
+            task = self._task_for_session(task_id, expected_session_id)
             if task["status"] != "awaiting_review":
                 raise fail(
                     "SUBAGENT_NOT_REVIEWABLE",
@@ -789,13 +943,15 @@ class SubagentDemoManager:
                     {"error": str(exc), "changed_paths": changed},
                 )
                 raise
-            self.repository.update_attempt(attempt_id, status="accepted")
-            self.repository.update_task(
+            if not self.repository.complete_integration(
                 task_id,
-                status="merged",
-                accepted_attempt_id=attempt_id,
-                integration_commit=integration_commit,
-            )
+                attempt_id,
+                integration_commit,
+            ):
+                raise fail(
+                    "SUBAGENT_STATE_CHANGED",
+                    "The child task state changed while integrating its result.",
+                )
             self._event(
                 str(task["run_id"]),
                 task_id,
@@ -980,26 +1136,12 @@ class SubagentDemoManager:
         def request_parent_input(question: str) -> dict[str, Any]:
             """Pause after this turn and ask the parent Agent for missing information."""
             parent_request.update(kind="parent_input", question=question)
-            self._event(
-                run_id,
-                task_id,
-                attempt_id,
-                "parent_input.requested",
-                {"question": question},
-            )
             return {"ok": True, "status": "waiting_parent", "instruction": "End this turn now."}
 
         @tool
         def request_capability(tools: list[str], reason: str) -> dict[str, Any]:
             """Pause after this turn and request additional local or MCP tools."""
             parent_request.update(kind="capability", tools=tools, reason=reason)
-            self._event(
-                run_id,
-                task_id,
-                attempt_id,
-                "capability.requested",
-                {"tools": tools, "reason": reason},
-            )
             return {
                 "ok": True,
                 "status": "waiting_capability",
@@ -1176,23 +1318,34 @@ class SubagentDemoManager:
                 )
                 return
         if parent_request:
-            status = (
-                "waiting_capability"
-                if parent_request["kind"] == "capability"
-                else "waiting_parent"
+            capability_request = parent_request["kind"] == "capability"
+            status = "waiting_capability" if capability_request else "waiting_parent"
+            event_type = (
+                "capability.requested"
+                if capability_request
+                else "parent_input.requested"
             )
-            if not self.repository.transition_attempt(
-                attempt_id,
-                ("running",),
+            payload = (
+                {
+                    "tools": parent_request["tools"],
+                    "reason": parent_request["reason"],
+                }
+                if capability_request
+                else {"question": parent_request["question"]}
+            )
+            event_id = self.repository.pause_for_parent(
+                run_id=run_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
                 status=status,
-            ):
+                event_type=event_type,
+                payload=payload,
+                wake_type=event_type,
+                wake_priority=10,
+            )
+            if event_id is None:
                 raise fail("SUBAGENT_CANCELLED", "Child Agent execution was cancelled.")
-            if not self.repository.transition_task(
-                task_id,
-                ("running",),
-                status=status,
-            ):
-                raise fail("SUBAGENT_CANCELLED", "Child Agent execution was cancelled.")
+            self._notify_wake(task_id, event_id)
             return
         if cancelled.is_set():
             raise fail("SUBAGENT_CANCELLED", "Child Agent execution was cancelled.")
@@ -1558,6 +1711,7 @@ class SubagentDemoManager:
                 "queued",
                 "running",
                 "cancelling",
+                "integrating",
                 "waiting_parent",
                 "waiting_capability",
                 "revision_required",
@@ -1661,15 +1815,20 @@ class SubagentDemoManager:
             wake_type=wake[0] if wake else None,
             wake_priority=wake[1] if wake else 100,
         )
-        if wake is not None and self._on_wake is not None:
-            task = self.repository.task(task_id)
-            request = next(
-                (
-                    item
-                    for item in self.repository.pending_wakes(str(task["session_id"]))
-                    if int(item["event_id"]) == event_id
-                ),
-                None,
-            )
-            if request is not None:
-                self._on_wake(request)
+        if wake is not None:
+            self._notify_wake(task_id, event_id)
+
+    def _notify_wake(self, task_id: str, event_id: int) -> None:
+        if self._on_wake is None:
+            return
+        task = self.repository.task(task_id)
+        request = next(
+            (
+                item
+                for item in self.repository.pending_wakes(str(task["session_id"]))
+                if int(item["event_id"]) == event_id
+            ),
+            None,
+        )
+        if request is not None:
+            self._on_wake(request)

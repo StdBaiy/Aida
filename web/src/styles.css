@@ -1282,6 +1282,23 @@ button:disabled {
   font-size: 11px;
 }
 
+.inline-query-error {
+  display: grid;
+  min-height: 96px;
+  grid-template-columns: auto auto;
+  align-content: center;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.inline-query-error .secondary-button {
+  grid-column: 1 / -1;
+  justify-self: center;
+}
+
 .composer-stack {
   min-width: 0;
   background: linear-gradient(to bottom, rgb(255 255 255 / 60%), #fff 22%);
@@ -1660,11 +1677,20 @@ button:disabled {
 
 .code-header > div {
   display: flex;
+  align-items: center;
   gap: 7px;
 }
 
 .code-header small {
   color: var(--faint);
+}
+
+.truncation-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--warning) !important;
+  white-space: nowrap;
 }
 
 .diff-code,

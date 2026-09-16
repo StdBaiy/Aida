@@ -150,6 +150,27 @@ def test_running_operation_can_request_cancellation(tmp_path: Path) -> None:
     journal.close()
 
 
+def test_interrupted_operation_gets_a_replayable_terminal_event(tmp_path: Path) -> None:
+    database = tmp_path / "agent.db"
+    journal = EventJournal(database)
+    operation_id, _ = journal.create_operation(
+        session_id="session",
+        timeline_id="timeline",
+        kind="turn",
+        client_request_id="request-1",
+    )
+    journal.set_status(operation_id, "running")
+    journal.close()
+
+    recovered = EventJournal(database)
+
+    assert recovered.operation(operation_id)["status"] == "recovery_required"  # type: ignore[index]
+    assert recovered.events_after(operation_id, 0)[-1]["event_type"] == (
+        "operation.recovery_required"
+    )
+    recovered.close()
+
+
 def test_operation_cancellation_propagates_to_active_tool_runs(tmp_path: Path) -> None:
     journal = EventJournal(tmp_path / "agent.db")
     operation_id, _ = journal.create_operation(
@@ -283,6 +304,7 @@ def test_cancelling_operation_wakes_pending_approval(tmp_path: Path) -> None:
         if time.monotonic() >= deadline:
             raise AssertionError("approval was not persisted")
         time.sleep(0.01)
+    assert journal.pending_approvals()[0]["session_id"] == "session"
 
     cancelled.set()
     broker.cancel_operation(operation_id)
@@ -342,6 +364,43 @@ def test_session_can_be_created_while_an_existing_session_is_running() -> None:
         "active_timeline_id": "new-timeline",
     }
     assert host.session_id == "new-session"
+
+
+def test_restore_keeps_its_original_session_after_selection_changes() -> None:
+    host = CodingAgentHost.__new__(CodingAgentHost)
+    host.session_id = "session-b"
+    host._operation_lock = threading.Lock()
+    host._operation_lock.acquire()
+    restored: list[int] = []
+    timeline_lookups: list[str] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+    statuses: list[str] = []
+    runner = SimpleNamespace(
+        coordinator=SimpleNamespace(restore=lambda turn_number: restored.append(turn_number))
+    )
+    host.repository = SimpleNamespace(
+        active_timeline=lambda session_id: (
+            timeline_lookups.append(session_id)
+            or SimpleNamespace(timeline_id=f"{session_id}-restored")
+        )
+    )
+    host.journal = SimpleNamespace(
+        set_status=lambda _operation_id, status, **_kwargs: statuses.append(status) or True,
+        append=lambda _operation_id, event_type, payload: events.append((event_type, payload)),
+    )
+    host.workspace_status = lambda: {"clean": True}  # type: ignore[method-assign]
+
+    host._run_restore("operation-a", "session-a", runner, 3)
+
+    assert restored == [3]
+    assert timeline_lookups == ["session-a"]
+    assert statuses == ["running", "completed"]
+    assert ("step.completed", {"kind": "restore", "timeline_id": "session-a-restored"}) in events
+    assert (
+        "operation.completed",
+        {"kind": "restore", "timeline_id": "session-a-restored"},
+    ) in events
+    assert not host._operation_lock.locked()
 
 
 def test_host_uses_configured_parallel_session_capacity() -> None:

@@ -87,6 +87,40 @@ test("mobile switches between conversation and workspace without overflow", asyn
   await page.screenshot({ path: "test-results/mobile-workspace.png", fullPage: true });
 });
 
+test("marks truncated diffs and file previews", async ({ page }) => {
+  await mockWorkbench(page, {
+    "/api/v1/workspace/diff": {
+      files: [
+        {
+          path: "large.txt",
+          status: "M",
+          additions: 1,
+          deletions: 0,
+          patch: "+partial",
+          truncated: true,
+        },
+      ],
+    },
+    "/api/v1/workspace/files": {
+      files: [{ path: "large.txt", size: 2_000_000 }],
+    },
+    "/api/v1/workspace/files/content": {
+      path: "large.txt",
+      sha256: "abc",
+      byte_size: 2_000_000,
+      binary: false,
+      truncated: true,
+      content: "partial content",
+    },
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("仅显示前 1 MiB")).toBeVisible();
+  await page.getByRole("button", { name: "文件", exact: true }).click();
+  await page.getByText("large.txt", { exact: true }).click();
+  await expect(page.getByText("内容已截断")).toBeVisible();
+});
+
 test("filters empty tasks, right-aligns users, and renders agent markdown", async ({ page }) => {
   await page.route("**/api/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -239,7 +273,10 @@ test("new session is created on first input while the previous session runs", as
         body:
           "id: 1\n" +
           "event: turn.committed\n" +
-          'data: {"operation_id":"operation-1","sequence":1}\n\n',
+          'data: {"operation_id":"operation-1","sequence":1}\n\n' +
+          "id: 2\n" +
+          "event: operation.completed\n" +
+          'data: {"operation_id":"operation-1","sequence":2}\n\n',
       });
       return;
     }
@@ -504,6 +541,7 @@ test("approval is an inline panel and does not take focus", async ({ page }) => 
           {
             approval_id: "approval-1",
             operation_id: "operation-1",
+            session_id: "active",
             request_hash: "hash-1",
             request: {
               name: "run_command",
@@ -542,6 +580,307 @@ test("approval is an inline panel and does not take focus", async ({ page }) => 
   await expect(page.locator(".inline-approval")).toContainText("python -m pytest");
   await page.getByRole("button", { name: "拒绝" }).click();
   await expect.poll(() => decision).toBe("reject");
+});
+
+test("keeps runtime state and approvals isolated across sessions", async ({
+  page,
+}) => {
+  let selectedSession = "session-a";
+  let operationEventRequests = 0;
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const selectedMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)\/select$/);
+    if (request.method() === "POST" && selectedMatch) {
+      selectedSession = selectedMatch[1];
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_id: selectedSession,
+          active_timeline_id: `${selectedSession}-timeline`,
+          title: selectedSession,
+          turn_count: 0,
+          created_at: "2026-09-16T00:00:00Z",
+        }),
+      });
+      return;
+    }
+    if (path === "/api/v1/operations/operation-a/events") {
+      operationEventRequests += 1;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          operationEventRequests === 1
+            ? 'id: 1\nevent: assistant.delta\ndata: {"text":"A 后台输出"}\n\n'
+            : "",
+      });
+      return;
+    }
+    const sessions = ["session-a", "session-b"].map((id) => ({
+      session_id: id,
+      active_timeline_id: `${id}-timeline`,
+      title: id === "session-a" ? "任务 A" : "任务 B",
+      turn_count: 0,
+      created_at: "2026-09-16T00:00:00Z",
+    }));
+    const responses: Record<string, unknown> = {
+      "/api/v1/status": {
+        service: "ready",
+        workspace: "/tmp/test",
+        workspace_name: "test",
+        branch: "main",
+        model: "test-model",
+        session_id: selectedSession,
+        timeline_id: `${selectedSession}-timeline`,
+        csrf_token: "csrf",
+        active_operation:
+          selectedSession === "session-a"
+            ? {
+                operation_id: "operation-a",
+                session_id: "session-a",
+                status: "running",
+                kind: "turn",
+              }
+            : null,
+        active_operations: [
+          {
+            operation_id: "operation-a",
+            session_id: "session-a",
+            status: "running",
+            kind: "turn",
+          },
+        ],
+        pending_approvals: [
+          {
+            approval_id: "approval-a",
+            operation_id: "operation-a",
+            session_id: "session-a",
+            request_hash: "hash-a",
+            request: {
+              name: "run_command",
+              args: { argv: ["npm", "test"] },
+            },
+          },
+        ],
+      },
+      "/api/v1/workspaces": { active: "/tmp/test", recent: [] },
+      "/api/v1/sessions": { items: sessions, next_offset: null },
+      "/api/v1/sessions/session-a/turns": {
+        timeline_id: "session-a-timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/sessions/session-b/turns": {
+        timeline_id: "session-b-timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/workspace/status": {
+        branch: "main",
+        changed_file_count: 0,
+        added_lines: 0,
+        deleted_lines: 0,
+        clean: true,
+      },
+      "/api/v1/workspace/diff": { files: [] },
+    };
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(responses[path] ?? {}),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByText("A 后台输出")).toBeVisible();
+  await expect(page.locator(".inline-approval")).toContainText("npm test");
+  await expect(
+    page.locator(".session-row").filter({ hasText: "任务 A" }),
+  ).toContainText("等待审批");
+
+  await page.getByText("任务 B", { exact: true }).click();
+  const composer = page.getByPlaceholder("描述你希望 Agent 完成的任务");
+  await expect(page.locator(".inline-approval")).toHaveCount(0);
+  await composer.fill("B 的草稿");
+
+  await page.getByText("任务 A", { exact: true }).click();
+  await expect(page.getByText("A 后台输出")).toBeVisible();
+  await expect(page.locator(".inline-approval")).toContainText("npm test");
+
+  await page.getByText("任务 B", { exact: true }).click();
+  await expect(composer).toHaveValue("B 的草稿");
+  await expect(page.locator(".inline-approval")).toHaveCount(0);
+});
+
+test("rapid session switches commit the last selection", async ({ page }) => {
+  let selectedSession = "session-a";
+  const selectionOrder: string[] = [];
+  let releaseFirstSelection: () => void = () => {};
+  const firstSelection = new Promise<void>((resolve) => {
+    releaseFirstSelection = resolve;
+  });
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const selectedMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)\/select$/);
+    if (request.method() === "POST" && selectedMatch) {
+      const id = selectedMatch[1];
+      selectionOrder.push(id);
+      if (id === "session-b") await firstSelection;
+      selectedSession = id;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_id: id,
+          active_timeline_id: `${id}-timeline`,
+          title: id,
+          turn_count: 0,
+          created_at: "2026-09-16T00:00:00Z",
+        }),
+      });
+      return;
+    }
+    const sessionItems = ["session-a", "session-b", "session-c"].map((id) => ({
+      session_id: id,
+      active_timeline_id: `${id}-timeline`,
+      title: `任务 ${id.at(-1)?.toUpperCase()}`,
+      turn_count: 0,
+      created_at: "2026-09-16T00:00:00Z",
+    }));
+    const responses: Record<string, unknown> = {
+      "/api/v1/status": {
+        service: "ready",
+        workspace: "/tmp/test",
+        workspace_name: "test",
+        branch: "main",
+        model: "test-model",
+        session_id: selectedSession,
+        timeline_id: `${selectedSession}-timeline`,
+        csrf_token: "csrf",
+        active_operation: null,
+        active_operations: [],
+        pending_approvals: [],
+      },
+      "/api/v1/workspaces": { active: "/tmp/test", recent: [] },
+      "/api/v1/sessions": { items: sessionItems, next_offset: null },
+      "/api/v1/sessions/session-a/turns": {
+        timeline_id: "session-a-timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/sessions/session-b/turns": {
+        timeline_id: "session-b-timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/sessions/session-c/turns": {
+        timeline_id: "session-c-timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/workspace/status": {
+        branch: "main",
+        changed_file_count: 0,
+        added_lines: 0,
+        deleted_lines: 0,
+        clean: true,
+      },
+      "/api/v1/workspace/diff": { files: [] },
+    };
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(responses[path] ?? {}),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByText("任务 B", { exact: true }).click();
+  await expect.poll(() => selectionOrder).toEqual(["session-b"]);
+  await page.getByText("任务 C", { exact: true }).click();
+  releaseFirstSelection();
+
+  await expect.poll(() => selectionOrder).toEqual(["session-b", "session-c"]);
+  await expect(
+    page.locator(".session-row.active").getByText("任务 C", { exact: true }),
+  ).toBeVisible();
+  expect(selectedSession).toBe("session-c");
+});
+
+test("SSE reconnect resumes from its cursor and ignores duplicate events", async ({
+  page,
+}) => {
+  const cursors: string[] = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/v1/operations/operation-1/events") {
+      cursors.push(new URL(request.url()).searchParams.get("after") ?? "");
+      const attempt = cursors.length;
+      await route.fulfill({
+        contentType: "text/event-stream",
+        body:
+          attempt === 1
+            ? 'id: 1\nevent: assistant.delta\ndata: {"sequence":1,"text":"片段一"}\n\n'
+            : attempt === 2
+              ? 'id: 1\nevent: assistant.delta\ndata: {"sequence":1,"text":"片段一"}\n\n' +
+                "id: 2\nevent: assistant.delta\ndata: {invalid json}\n\n" +
+                'id: 3\nevent: assistant.delta\ndata: {"sequence":3,"text":"片段二"}\n\n'
+              : "",
+      });
+      return;
+    }
+    const responses: Record<string, unknown> = {
+      "/api/v1/status": {
+        service: "ready",
+        workspace: "/tmp/test",
+        workspace_name: "test",
+        branch: "main",
+        model: "test-model",
+        session_id: "active",
+        timeline_id: "timeline",
+        csrf_token: "csrf",
+        active_operation: {
+          operation_id: "operation-1",
+          session_id: "active",
+          status: "running",
+          kind: "turn",
+        },
+        active_operations: [
+          {
+            operation_id: "operation-1",
+            session_id: "active",
+            status: "running",
+            kind: "turn",
+          },
+        ],
+        pending_approvals: [],
+      },
+      "/api/v1/workspaces": { active: "/tmp/test", recent: [] },
+      "/api/v1/sessions": { items: [], next_offset: null },
+      "/api/v1/sessions/active/turns": {
+        timeline_id: "timeline",
+        turns: [],
+        next_before_turn_number: null,
+      },
+      "/api/v1/workspace/status": {
+        branch: "main",
+        changed_file_count: 0,
+        added_lines: 0,
+        deleted_lines: 0,
+        clean: true,
+      },
+      "/api/v1/workspace/diff": { files: [] },
+    };
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(responses[path] ?? {}),
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.locator(".streaming")).toContainText("片段一");
+  await expect.poll(() => cursors.length, { timeout: 10_000 }).toBeGreaterThan(1);
+  await expect(page.locator(".streaming")).toHaveText("片段一片段二");
+  expect(cursors).toContain("1");
 });
 
 test("empty host opens a recent directory and enters its isolated workspace", async ({
@@ -649,7 +988,8 @@ test("renders concurrent tool runs as independent live cards", async ({ page }) 
           "id: 5\n" +
           "event: tool.completed\n" +
           'data: {"run_id":"run-beta","tool":"pytest-b","status":"completed",' +
-          '"duration_ms":842,"exit_code":0,"result_preview":"{\\"ok\\": true}"}\n\n' +
+          '"duration_ms":842,"exit_code":0,"output_truncated":true,' +
+          '"result_preview":"{\\"ok\\": true}"}\n\n' +
           "id: 6\n" +
           "event: context.window_usage\n" +
           'data: {"total_tokens":420000,"hard_limit":1000000,"usage_ratio":0.42}\n\n',
@@ -696,6 +1036,7 @@ test("renders concurrent tool runs as independent live cards", async ({ page }) 
   await expect(page.locator(".tool-run-card").nth(0)).toContainText("pytest-a");
   await expect(page.locator(".tool-run-card").nth(0)).toContainText("collecting tests");
   await expect(page.locator(".tool-run-card").nth(1)).toContainText("已完成");
+  await expect(page.locator(".tool-run-card").nth(1)).toContainText("输出已截断");
   await expect(page.locator(".tool-run-grid")).toHaveAttribute("aria-label", "并行工具");
   await expect(page.getByText("上下文占用 42%")).toBeVisible();
   await page.screenshot({ path: "test-results/parallel-tools-desktop.png", fullPage: true });
@@ -811,6 +1152,7 @@ test("cancelling parallel tools preserves the conversation", async ({ page }) =>
 
   await page.goto("/");
   await expect(page.getByText("保留的历史消息")).toBeVisible();
+  await expect(page.getByRole("button", { name: "恢复到此轮" })).toBeDisabled();
   await page.getByTitle("停止当前任务").click();
 
   await expect(page.getByText("后台执行两个工具")).toBeVisible();

@@ -230,7 +230,13 @@ def create_app(
                 media_type="text/event-stream",
                 status_code=404,
             )
-        cursor = int(last_event_id or request.query_params.get("after", "0"))
+        try:
+            cursor = max(
+                0,
+                int(last_event_id or request.query_params.get("after", "0")),
+            )
+        except ValueError:
+            cursor = 0
 
         async def generate() -> AsyncIterator[str]:
             nonlocal cursor

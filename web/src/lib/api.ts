@@ -111,6 +111,7 @@ export type Operation = {
 export type Approval = {
   approval_id: string;
   operation_id: string;
+  session_id: string;
   request_hash: string;
   request: {
     name?: string;
@@ -193,6 +194,7 @@ export type ToolRunView = {
   duration_ms?: number | null;
   error?: string | null;
   result_preview?: string;
+  output_truncated?: boolean;
 };
 
 export type WorkspaceStatus = {
@@ -236,6 +238,7 @@ export type TraceSpan = {
   started_at: string;
   ended_at: string | null;
   attributes_json: string;
+  attributes_json_truncated?: boolean;
 };
 
 export type TraceSummary = {
@@ -267,7 +270,14 @@ export type TraceChain = {
 export type StreamEvent = {
   type: string;
   data: Record<string, unknown>;
+  sequence: number;
 };
+
+export type StreamConnectionState =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "closed";
 
 let csrfToken = "";
 
@@ -299,8 +309,17 @@ export function subscribe(
   operationId: string,
   onEvent: (event: StreamEvent) => void,
   onDone: () => void,
+  options: {
+    after?: number;
+    onCursor?: (sequence: number) => void;
+    onState?: (state: StreamConnectionState) => void;
+    onError?: (message: string) => void;
+  } = {},
 ): () => void {
-  const source = new EventSource(`/api/v1/operations/${operationId}/events`);
+  let cursor = options.after ?? 0;
+  let source: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
   const types = [
     "turn.started",
     "user.message",
@@ -335,24 +354,62 @@ export function subscribe(
     "context.window_usage",
     "workspace.changed",
     "turn.committed",
+    "operation.completed",
     "operation.failed",
     "operation.cancellation_requested",
     "operation.cancelled",
+    "operation.recovery_required",
   ];
-  for (const type of types) {
-    source.addEventListener(type, (raw) => {
-      const message = raw as MessageEvent<string>;
-      onEvent({ type, data: JSON.parse(message.data) as Record<string, unknown> });
-      if (["turn.committed", "operation.failed", "operation.cancelled"].includes(type)) {
-        source.close();
-        onDone();
-      }
-    });
-  }
-  source.onerror = () => {
-    if (source.readyState === EventSource.CLOSED) onDone();
+  const terminalTypes = new Set([
+    "operation.completed",
+    "operation.failed",
+    "operation.cancelled",
+    "operation.recovery_required",
+  ]);
+
+  const connect = () => {
+    if (stopped) return;
+    options.onState?.(cursor ? "reconnecting" : "connecting");
+    source = new EventSource(
+      `/api/v1/operations/${operationId}/events?after=${cursor}`,
+    );
+    source.onopen = () => options.onState?.("connected");
+    for (const type of types) {
+      source.addEventListener(type, (raw) => {
+        const message = raw as MessageEvent<string>;
+        let data: Record<string, unknown>;
+        try {
+          data = JSON.parse(message.data) as Record<string, unknown>;
+        } catch {
+          options.onError?.(`无法解析 ${type} 事件`);
+          return;
+        }
+        const sequence = Number(data.sequence ?? message.lastEventId);
+        if (!Number.isFinite(sequence) || sequence <= cursor) return;
+        cursor = sequence;
+        options.onCursor?.(sequence);
+        onEvent({ type, data, sequence });
+        if (terminalTypes.has(type)) {
+          stopped = true;
+          source?.close();
+          options.onState?.("closed");
+          onDone();
+        }
+      });
+    }
+    source.onerror = () => {
+      if (stopped) return;
+      source?.close();
+      options.onState?.("reconnecting");
+      reconnectTimer = setTimeout(connect, 500);
+    };
   };
-  return () => source.close();
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    source?.close();
+  };
 }
 
 export function post<T>(path: string, body: unknown): Promise<T> {

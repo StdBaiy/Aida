@@ -99,6 +99,7 @@ class _ToolRun:
     chunks: list[_OutputChunk] = field(default_factory=list)
     retained_output_bytes: int = 0
     emitted_output_bytes: int = 0
+    emitted_output_truncated: bool = False
     next_cursor: int = 1
     settled: bool = False
 
@@ -737,6 +738,8 @@ class ToolRunManager:
             remaining_event_bytes = max(0, self.max_output_bytes - run.emitted_output_bytes)
             event_chunk = chunk[:remaining_event_bytes]
             run.emitted_output_bytes += len(event_chunk)
+            if len(event_chunk) < len(chunk):
+                run.emitted_output_truncated = True
         if event_callback is not None and event_chunk:
             safe_text = str(
                 redact(
@@ -838,6 +841,7 @@ class ToolRunManager:
             "resource_usage": result.get("resource_usage"),
             "error": run.error,
             "result_preview": safe_preview,
+            "output_truncated": run.emitted_output_truncated,
         }
 
     @staticmethod

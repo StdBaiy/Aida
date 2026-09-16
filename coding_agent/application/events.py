@@ -56,6 +56,14 @@ class EventJournal:
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(_SCHEMA)
+        interrupted = self.connection.execute(
+            """
+            SELECT operation_id FROM operations
+            WHERE status IN (
+                'queued', 'running', 'waiting_approval', 'cancel_requested', 'committing'
+            )
+            """
+        ).fetchall()
         self.connection.execute(
             """
             UPDATE operations
@@ -69,6 +77,17 @@ class EventJournal:
         self.connection.commit()
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
+        for row in interrupted:
+            self.append(
+                str(row["operation_id"]),
+                "operation.recovery_required",
+                {
+                    "error": {
+                        "code": "RECOVERY_REQUIRED",
+                        "message": "The host stopped before this operation completed.",
+                    }
+                },
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -262,7 +281,13 @@ class EventJournal:
     def pending_approvals(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.connection.execute(
-                "SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at"
+                """
+                SELECT approvals.*, operations.session_id
+                FROM approvals
+                JOIN operations USING (operation_id)
+                WHERE approvals.status = 'pending'
+                ORDER BY approvals.created_at
+                """
             ).fetchall()
         result = []
         for row in rows:

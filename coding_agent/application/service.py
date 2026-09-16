@@ -520,6 +520,11 @@ class CodingAgentHost:
                 },
             )
             self.journal.append(operation_id, "workspace.changed", self.workspace_status())
+            self.journal.append(
+                operation_id,
+                "operation.completed",
+                {"kind": "turn", "timeline_id": timeline.timeline_id},
+            )
             completed = self.journal.set_status(
                 operation_id,
                 "completed",
@@ -669,7 +674,15 @@ class CodingAgentHost:
                 kind="restore",
                 client_request_id=None,
             )
-            self._schedule(self._run_restore, operation_id, turn_number)
+            runner = self._runner(session_id)
+            self._schedule_operation(
+                operation_id,
+                self._run_restore,
+                operation_id,
+                session_id,
+                runner,
+                turn_number,
+            )
             return {
                 "operation_id": operation_id,
                 "status": "queued",
@@ -680,20 +693,31 @@ class CodingAgentHost:
                 self._operation_lock.release()
             raise
 
-    def _run_restore(self, operation_id: str, turn_number: int) -> None:
+    def _run_restore(
+        self,
+        operation_id: str,
+        session_id: str,
+        runner: _SessionRunner,
+        turn_number: int,
+    ) -> None:
         try:
             self.journal.set_status(operation_id, "running")
             self.journal.append(
                 operation_id, "step.started", {"kind": "restore", "turn_number": turn_number}
             )
-            self.coordinator.restore(turn_number)
-            timeline = self.repository.active_timeline(self.session_id)
+            runner.coordinator.restore(turn_number)
+            timeline = self.repository.active_timeline(session_id)
             self.journal.append(
                 operation_id,
                 "step.completed",
                 {"kind": "restore", "timeline_id": timeline.timeline_id},
             )
             self.journal.append(operation_id, "workspace.changed", self.workspace_status())
+            self.journal.append(
+                operation_id,
+                "operation.completed",
+                {"kind": "restore", "timeline_id": timeline.timeline_id},
+            )
             self.journal.set_status(
                 operation_id,
                 "completed",

@@ -38,7 +38,14 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FormEvent,
+  SetStateAction,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   type InfiniteData,
   useInfiniteQuery,
@@ -55,6 +62,7 @@ import {
   Session,
   SessionPage,
   SettingsConfig,
+  StreamConnectionState,
   StreamEvent,
   SubagentDemo,
   SubagentEvent,
@@ -74,20 +82,54 @@ import {
 
 type InspectorTab = "changes" | "files" | "preview";
 type MobileView = "tasks" | "chat" | "workspace";
+type SessionRuntimeState = {
+  draft: string;
+  pendingTurn: Turn | null;
+  streamText: string;
+  running: boolean;
+  cancelling: boolean;
+  operationId: string | null;
+  events: StreamEvent[];
+  toolRuns: Record<string, ToolRunView>;
+  eventCursors: Record<string, number>;
+  connectionState: StreamConnectionState;
+  approval: Approval | null;
+  error: string;
+};
+
+const NEW_TASK_RUNTIME_KEY = "__new_task__";
+
+function createSessionRuntime(): SessionRuntimeState {
+  return {
+    draft: "",
+    pendingTurn: null,
+    streamText: "",
+    running: false,
+    cancelling: false,
+    operationId: null,
+    events: [],
+    toolRuns: {},
+    eventCursors: {},
+    connectionState: "closed",
+    approval: null,
+    error: "",
+  };
+}
+
+function resolveStateAction<T>(current: T, action: SetStateAction<T>): T {
+  return typeof action === "function"
+    ? (action as (value: T) => T)(current)
+    : action;
+}
 
 export function App() {
   const queryClient = useQueryClient();
-  const [draft, setDraft] = useState("");
-  const [pendingTurn, setPendingTurn] = useState<Turn | null>(null);
-  const [streamText, setStreamText] = useState("");
-  const [running, setRunning] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
+  const [runtimeBySession, setRuntimeBySession] = useState<
+    Record<string, SessionRuntimeState>
+  >({});
+  const runtimeBySessionRef = useRef(runtimeBySession);
+  runtimeBySessionRef.current = runtimeBySession;
   const [demoStarting, setDemoStarting] = useState(false);
-  const [operationId, setOperationId] = useState<string | null>(null);
-  const [events, setEvents] = useState<StreamEvent[]>([]);
-  const [toolRuns, setToolRuns] = useState<Record<string, ToolRunView>>({});
-  const [approval, setApproval] = useState<Approval | null>(null);
-  const [error, setError] = useState("");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("changes");
   const [selectedDiff, setSelectedDiff] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -106,8 +148,16 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(
     () => localStorage.getItem("coding-agent.inspector-open") !== "false",
   );
-  const streamStop = useRef<null | (() => void)>(null);
-  const followedOperation = useRef<string | null>(null);
+  const subscriptions = useRef(
+    new Map<string, { sessionId: string; stop: () => void }>(),
+  );
+  const selectionEpoch = useRef(0);
+  const desiredSelection = useRef<{ id: string; epoch: number } | null>(null);
+  const selectionWorkerRunning = useRef(false);
+  const streamBuffers = useRef(new Map<string, string>());
+  const streamFlushTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const messages = useRef<HTMLDivElement>(null);
+  const followMessages = useRef(true);
   const messageEnd = useRef<HTMLDivElement>(null);
 
   const status = useQuery({
@@ -130,6 +180,63 @@ export function App() {
     enabled: Boolean(status.data?.workspace),
   });
   const sessionId = status.data?.session_id;
+  const runtimeKey = newTaskDraft
+    ? NEW_TASK_RUNTIME_KEY
+    : (sessionId ?? NEW_TASK_RUNTIME_KEY);
+  const runtime = runtimeBySession[runtimeKey] ?? createSessionRuntime();
+  const {
+    draft,
+    pendingTurn,
+    streamText,
+    running,
+    cancelling,
+    operationId,
+    events,
+    toolRuns,
+    approval,
+    error,
+  } = runtime;
+  const updateRuntime = (
+    key: string,
+    update: (current: SessionRuntimeState) => SessionRuntimeState,
+  ) => {
+    setRuntimeBySession((current) => {
+      const previous = current[key] ?? createSessionRuntime();
+      const next = update(previous);
+      return next === previous ? current : { ...current, [key]: next };
+    });
+  };
+  const setRuntimeField = <K extends keyof SessionRuntimeState>(
+    key: string,
+    field: K,
+    action: SetStateAction<SessionRuntimeState[K]>,
+  ) => {
+    updateRuntime(key, (current) => ({
+      ...current,
+      [field]: resolveStateAction(current[field], action),
+    }));
+  };
+  const setDraft = (value: SetStateAction<string>) =>
+    setRuntimeField(runtimeKey, "draft", value);
+  const setPendingTurn = (value: SetStateAction<Turn | null>) =>
+    setRuntimeField(runtimeKey, "pendingTurn", value);
+  const setStreamText = (value: SetStateAction<string>) =>
+    setRuntimeField(runtimeKey, "streamText", value);
+  const setRunning = (value: SetStateAction<boolean>) =>
+    setRuntimeField(runtimeKey, "running", value);
+  const setCancelling = (value: SetStateAction<boolean>) =>
+    setRuntimeField(runtimeKey, "cancelling", value);
+  const setEvents = (value: SetStateAction<StreamEvent[]>) =>
+    setRuntimeField(runtimeKey, "events", value);
+  const setToolRuns = (value: SetStateAction<Record<string, ToolRunView>>) =>
+    setRuntimeField(runtimeKey, "toolRuns", value);
+  const setApproval = (value: SetStateAction<Approval | null>) =>
+    setRuntimeField(runtimeKey, "approval", value);
+  const setError = (value: SetStateAction<string>) =>
+    setRuntimeField(runtimeKey, "error", value);
+  const pendingApprovalSignature = status.data?.pending_approvals
+    .map((item) => `${item.session_id}:${item.approval_id}`)
+    .join("|");
   const subagentRuns = useQuery({
     queryKey: ["subagent-runs", sessionId],
     queryFn: () =>
@@ -199,31 +306,63 @@ export function App() {
     enabled: settingsOpen,
   });
 
-  const refresh = () => {
+  const refresh = (targetSessionId: string | null = sessionId ?? null) => {
     void queryClient.invalidateQueries({ queryKey: ["status"] });
     void queryClient.invalidateQueries({ queryKey: ["sessions"] });
     void queryClient.invalidateQueries({ queryKey: ["workspace-status"] });
     void queryClient.invalidateQueries({ queryKey: ["diff"] });
     void queryClient.invalidateQueries({ queryKey: ["diff-content"] });
-    void queryClient.invalidateQueries({ queryKey: ["subagent-runs", sessionId] });
+    if (targetSessionId) {
+      void queryClient.invalidateQueries({
+        queryKey: ["subagent-runs", targetSessionId],
+      });
+      return queryClient.invalidateQueries({
+        queryKey: ["turns", targetSessionId],
+      });
+    }
     return queryClient.invalidateQueries({ queryKey: ["turns"] });
   };
 
-  const handleEvent = (event: StreamEvent) => {
-    setEvents((current) => [...current.slice(-99), event]);
+  const handleEvent = (targetSessionId: string, event: StreamEvent) => {
     if (event.type === "assistant.delta") {
-      setStreamText((current) => current + String(event.data.text ?? ""));
+      streamBuffers.current.set(
+        targetSessionId,
+        (streamBuffers.current.get(targetSessionId) ?? "") +
+          String(event.data.text ?? ""),
+      );
+      if (!streamFlushTimers.current.has(targetSessionId)) {
+        const timer = setTimeout(() => {
+          const text = streamBuffers.current.get(targetSessionId) ?? "";
+          streamBuffers.current.delete(targetSessionId);
+          streamFlushTimers.current.delete(targetSessionId);
+          if (text) {
+            updateRuntime(targetSessionId, (current) => ({
+              ...current,
+              streamText: current.streamText + text,
+            }));
+          }
+        }, 50);
+        streamFlushTimers.current.set(targetSessionId, timer);
+      }
+      return;
     }
-    if (event.type === "approval.required") {
-      setApproval(event.data as unknown as Approval);
-    }
-    if (event.type === "approval.resolved") setApproval(null);
-    if (event.type.startsWith("tool.")) {
-      const runId = String(event.data.run_id ?? "");
-      if (runId) {
-        setToolRuns((current) => {
-          const prior = current[runId];
-          const next: ToolRunView = {
+    updateRuntime(targetSessionId, (current) => {
+      let next: SessionRuntimeState = {
+        ...current,
+        events: [...current.events.slice(-99), event],
+      };
+      if (event.type === "approval.required") {
+        next.approval = {
+          ...(event.data as unknown as Approval),
+          session_id: targetSessionId,
+        };
+      }
+      if (event.type === "approval.resolved") next.approval = null;
+      if (event.type.startsWith("tool.")) {
+        const runId = String(event.data.run_id ?? "");
+        if (runId) {
+          const prior = next.toolRuns[runId];
+          const toolRun: ToolRunView = {
             run_id: runId,
             tool: String(event.data.tool ?? prior?.tool ?? "tool"),
             effect: String(event.data.effect ?? prior?.effect ?? "unknown"),
@@ -260,82 +399,165 @@ export function App() {
               typeof event.data.result_preview === "string"
                 ? event.data.result_preview
                 : prior?.result_preview,
+            output_truncated:
+              Boolean(event.data.output_truncated) ||
+              Boolean(prior?.output_truncated) ||
+              (event.type === "tool.output" &&
+                `${prior?.output ?? ""}${String(event.data.text ?? "")}`.length >
+                  4000),
           };
-          return { ...current, [runId]: next };
-        });
+          return {
+            ...next,
+            toolRuns: { ...next.toolRuns, [runId]: toolRun },
+          };
+        }
       }
-    }
-    if (event.type === "operation.failed") {
-      const detail = event.data.error as { code?: string; message?: string };
-      setError(`${detail?.code ?? "RUNTIME_ERROR"}: ${detail?.message ?? "执行失败"}`);
-    }
-    if (event.type === "operation.cancellation_requested") setCancelling(true);
+      if (
+        event.type === "operation.failed" ||
+        event.type === "operation.recovery_required"
+      ) {
+        const detail = event.data.error as { code?: string; message?: string };
+        next.error = `${detail?.code ?? "RUNTIME_ERROR"}: ${
+          detail?.message ??
+          (event.type === "operation.recovery_required"
+            ? "Host 重启后无法继续该任务"
+            : "执行失败")
+        }`;
+      }
+      if (event.type === "operation.cancellation_requested") {
+        next.cancelling = true;
+      }
+      return next;
+    });
   };
 
-  const followOperation = (id: string) => {
-    followedOperation.current = null;
-    streamStop.current?.();
-    followedOperation.current = id;
-    setOperationId(id);
-    setRunning(true);
-    setCancelling(false);
-    streamStop.current = subscribe(
+  const followOperation = (targetSessionId: string, id: string) => {
+    if (subscriptions.current.has(id)) return;
+    updateRuntime(targetSessionId, (current) => ({
+      ...current,
+      operationId: id,
+      running: true,
+      cancelling: false,
+      connectionState: "connecting",
+    }));
+    const stop = subscribe(
       id,
-      (event) => {
-        if (followedOperation.current === id) handleEvent(event);
-      },
+      (event) => handleEvent(targetSessionId, event),
       () => {
-        if (followedOperation.current !== id) return;
-        followedOperation.current = null;
-        setRunning(false);
-        setCancelling(false);
-        setOperationId(null);
-        setStreamText("");
-        void refresh().finally(() => setPendingTurn(null));
+        subscriptions.current.delete(id);
+        const flushTimer = streamFlushTimers.current.get(targetSessionId);
+        if (flushTimer) clearTimeout(flushTimer);
+        streamFlushTimers.current.delete(targetSessionId);
+        streamBuffers.current.delete(targetSessionId);
+        updateRuntime(targetSessionId, (current) =>
+          current.operationId === id
+            ? {
+                ...current,
+                running: false,
+                cancelling: false,
+                operationId: null,
+                streamText: "",
+                pendingTurn: null,
+                connectionState: "closed",
+              }
+            : current,
+        );
+        void refresh(targetSessionId);
+      },
+      {
+        after:
+          runtimeBySessionRef.current[targetSessionId]?.eventCursors[id] ?? 0,
+        onCursor: (sequence) => {
+          updateRuntime(targetSessionId, (current) => ({
+            ...current,
+            eventCursors: { ...current.eventCursors, [id]: sequence },
+          }));
+        },
+        onState: (connectionState) => {
+          updateRuntime(targetSessionId, (current) =>
+            current.operationId === id
+              ? { ...current, connectionState }
+              : current,
+          );
+        },
+        onError: (message) => {
+          updateRuntime(targetSessionId, (current) => ({
+            ...current,
+            error: message,
+          }));
+        },
       },
     );
+    subscriptions.current.set(id, { sessionId: targetSessionId, stop });
   };
 
   useEffect(() => {
     if (!status.data) return;
-    if (newTaskDraft) {
-      followedOperation.current = null;
-      streamStop.current?.();
-      streamStop.current = null;
-      setRunning(false);
-      setCancelling(false);
-      setOperationId(null);
-      return;
-    }
-    if (status.data.active_operation) {
-      if (followedOperation.current !== status.data.active_operation.operation_id) {
-        followOperation(status.data.active_operation.operation_id);
-      }
-    } else {
-      const settledOperation = operationId;
-      setRunning(false);
-      setOperationId(null);
-      if (settledOperation) {
-        void refresh().finally(() => setPendingTurn(null));
+    const activeOperations = status.data.active_operations?.length
+      ? status.data.active_operations
+      : status.data.active_operation
+        ? [status.data.active_operation]
+        : [];
+    for (const operation of activeOperations) {
+      const targetSessionId =
+        operation.session_id ??
+        (operation.operation_id === status.data.active_operation?.operation_id
+          ? status.data.session_id
+          : null);
+      if (targetSessionId) {
+        followOperation(targetSessionId, operation.operation_id);
       }
     }
-    if (status.data.pending_approvals[0]) setApproval(status.data.pending_approvals[0]);
+    setRuntimeBySession((current) => {
+      const keys = new Set([
+        ...Object.keys(current),
+        ...status.data.pending_approvals.map((item) => item.session_id),
+      ]);
+      let changed = false;
+      const next = { ...current };
+      for (const key of keys) {
+        if (key === NEW_TASK_RUNTIME_KEY) continue;
+        const previous = current[key] ?? createSessionRuntime();
+        const nextApproval =
+          status.data.pending_approvals.find((item) => item.session_id === key) ??
+          null;
+        if (previous.approval?.approval_id !== nextApproval?.approval_id) {
+          next[key] = { ...previous, approval: nextApproval };
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
   }, [
-    newTaskDraft,
+    status.data?.active_operations
+      ?.map((operation) => `${operation.session_id}:${operation.operation_id}`)
+      .join("|"),
     status.data?.active_operation?.operation_id,
-    status.data?.session_id,
+    pendingApprovalSignature,
   ]);
 
   useEffect(() => {
     return () => {
-      followedOperation.current = null;
-      streamStop.current?.();
+      for (const subscription of subscriptions.current.values()) {
+        subscription.stop();
+      }
+      subscriptions.current.clear();
+      for (const timer of streamFlushTimers.current.values()) clearTimeout(timer);
+      streamFlushTimers.current.clear();
+      streamBuffers.current.clear();
     };
   }, []);
 
   useEffect(() => {
-    messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    if (followMessages.current) {
+      messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [turns.data, streamText, events.length]);
+
+  useEffect(() => {
+    followMessages.current = true;
+    messageEnd.current?.scrollIntoView();
+  }, [runtimeKey]);
 
   useEffect(() => {
     localStorage.setItem("coding-agent.inspector-open", String(inspectorOpen));
@@ -362,6 +584,7 @@ export function App() {
     setToolRuns({});
     setError("");
     setRunning(true);
+    let targetRuntimeKey = runtimeKey;
     try {
       let targetSessionId = sessionId;
       let targetTimelineId = status.data.timeline_id;
@@ -412,6 +635,13 @@ export function App() {
             };
           },
         );
+        setRuntimeBySession((current) => {
+          const temporary = current[NEW_TASK_RUNTIME_KEY] ?? createSessionRuntime();
+          const next = { ...current, [created.session_id]: temporary };
+          delete next[NEW_TASK_RUNTIME_KEY];
+          return next;
+        });
+        targetRuntimeKey = created.session_id;
         setNewTaskDraft(false);
       }
       const operation = await post<{ operation_id: string }>(
@@ -422,33 +652,29 @@ export function App() {
           expected_timeline_id: targetTimelineId,
         },
       );
-      followOperation(operation.operation_id);
+      followOperation(targetSessionId, operation.operation_id);
     } catch (cause) {
-      setRunning(false);
-      setPendingTurn(null);
-      setDraft(message);
-      setError(cause instanceof Error ? cause.message : String(cause));
-      refresh();
+      updateRuntime(targetRuntimeKey, (current) => ({
+        ...current,
+        running: false,
+        pendingTurn: null,
+        draft: message,
+        error: cause instanceof Error ? cause.message : String(cause),
+      }));
+      refresh(targetRuntimeKey === NEW_TASK_RUNTIME_KEY ? null : targetRuntimeKey);
     }
   };
 
   const startNewTask = () => {
-    followedOperation.current = null;
-    streamStop.current?.();
-    streamStop.current = null;
-    setRunning(false);
+    selectionEpoch.current += 1;
+    desiredSelection.current = null;
+    setRuntimeBySession((current) => ({
+      ...current,
+      [NEW_TASK_RUNTIME_KEY]: createSessionRuntime(),
+    }));
     setNewTaskDraft(true);
-    setDraft("");
-    setPendingTurn(null);
-    setStreamText("");
-    setEvents([]);
-    setToolRuns({});
-    setOperationId(null);
-    setCancelling(false);
-    setApproval(null);
     setSelectedTurn(null);
     setRestoreTurn(null);
-    setError("");
     setMobileView("chat");
   };
 
@@ -494,43 +720,73 @@ export function App() {
     }
   };
 
-  const selectSession = async (id: string) => {
-    if (id === sessionId && !newTaskDraft) return;
+  const runSelectionWorker = async () => {
+    if (selectionWorkerRunning.current) return;
+    selectionWorkerRunning.current = true;
     try {
-      followedOperation.current = null;
-      streamStop.current?.();
-      streamStop.current = null;
-      setRunning(false);
-      setCancelling(false);
-      setOperationId(null);
-      setStreamText("");
-      setEvents([]);
-      setToolRuns({});
-      setApproval(null);
-      if (id !== sessionId) {
-        const selected = await post<Session>(`/api/v1/sessions/${id}/select`, {});
-        queryClient.setQueryData<HostStatus>(["status"], (current) =>
-          current
-            ? {
-                ...current,
-                session_id: selected.session_id,
-                timeline_id: selected.active_timeline_id,
-                active_operation:
-                  current.active_operations?.find(
-                    (operation) => operation.session_id === selected.session_id,
-                  ) ?? null,
-              }
-            : current,
-        );
+      while (desiredSelection.current) {
+        const request = desiredSelection.current;
+        desiredSelection.current = null;
+        try {
+          const selected = await post<Session>(
+            `/api/v1/sessions/${request.id}/select`,
+            {},
+          );
+          if (
+            request.epoch !== selectionEpoch.current ||
+            desiredSelection.current
+          ) {
+            continue;
+          }
+          queryClient.setQueryData<HostStatus>(["status"], (current) =>
+            current
+              ? {
+                  ...current,
+                  session_id: selected.session_id,
+                  timeline_id: selected.active_timeline_id,
+                  active_operation:
+                    current.active_operations?.find(
+                      (operation) =>
+                        operation.session_id === selected.session_id,
+                    ) ?? null,
+                }
+              : current,
+          );
+          setNewTaskDraft(false);
+          setSelectedTurn(null);
+          setRestoreTurn(null);
+          void refresh(selected.session_id);
+        } catch (cause) {
+          if (
+            request.epoch === selectionEpoch.current &&
+            !desiredSelection.current
+          ) {
+            updateRuntime(request.id, (current) => ({
+              ...current,
+              error: String(cause),
+            }));
+          }
+        }
       }
-      setNewTaskDraft(false);
-      setDraft("");
-      setPendingTurn(null);
-      setSelectedTurn(null);
-      refresh();
-    } catch (cause) {
-      setError(String(cause));
+    } finally {
+      selectionWorkerRunning.current = false;
+      if (desiredSelection.current) void runSelectionWorker();
     }
+  };
+
+  const selectSession = (id: string) => {
+    if (
+      id === sessionId &&
+      !newTaskDraft &&
+      !selectionWorkerRunning.current &&
+      !desiredSelection.current
+    ) {
+      return;
+    }
+    const epoch = selectionEpoch.current + 1;
+    selectionEpoch.current = epoch;
+    desiredSelection.current = { id, epoch };
+    void runSelectionWorker();
   };
 
   const decide = async (decision: "approve" | "reject") => {
@@ -549,6 +805,13 @@ export function App() {
 
   const restore = async () => {
     if (!restoreTurn || !sessionId || !status.data) return;
+    if (
+      (status.data.active_operations?.length ?? 0) > 0 ||
+      status.data.active_operation
+    ) {
+      setError("WORKSPACE_BUSY: 工作区有任务正在运行，暂时不能恢复历史。");
+      return;
+    }
     try {
       const operation = await post<{ operation_id: string }>(
         `/api/v1/sessions/${sessionId}/restore`,
@@ -560,7 +823,7 @@ export function App() {
       setRestoreTurn(null);
       setEvents([]);
       setToolRuns({});
-      followOperation(operation.operation_id);
+      followOperation(sessionId, operation.operation_id);
     } catch (cause) {
       setError(String(cause));
     }
@@ -606,9 +869,7 @@ export function App() {
       setWorkspacePath("");
       setWorkspacePickerOpen(false);
       setNewTaskDraft(false);
-      setDraft("");
-      setPendingTurn(null);
-      setEvents([]);
+      setRuntimeBySession({});
       setSelectedTurn(null);
       setSelectedDiff(null);
       setSelectedFile(null);
@@ -640,7 +901,20 @@ export function App() {
   if (status.isError) return <FatalScreen message={String(status.error)} />;
   if (!status.data) return <FatalScreen message="Host 未返回状态。" />;
   const host = status.data;
+  const workspaceBusy =
+    (host.active_operations?.length ?? 0) > 0 ||
+    Boolean(host.active_operation);
   const sessionItems = sessions.data?.pages.flatMap((page) => page.items) ?? [];
+  const sessionStatuses = new Map(
+    (host.active_operations ?? []).flatMap((operation) =>
+      operation.session_id
+        ? [[operation.session_id, operation.status] as const]
+        : [],
+    ),
+  );
+  for (const pending of host.pending_approvals) {
+    sessionStatuses.set(pending.session_id, "waiting_approval");
+  }
   const visibleTurns = newTaskDraft
     ? []
     : [...(turns.data?.pages ?? [])]
@@ -735,13 +1009,7 @@ export function App() {
           open={sidebarOpen}
           sessions={sessionItems.filter((session) => session.turn_count >= 0)}
           activeId={newTaskDraft ? undefined : (sessionId ?? undefined)}
-          runningIds={
-            new Set(
-              (host.active_operations ?? [])
-                .map((operation) => operation.session_id)
-                .filter((value): value is string => Boolean(value)),
-            )
-          }
+          sessionStatuses={sessionStatuses}
           disabled={false}
           workspaceName={host.workspace_name ?? host.workspace}
           workspaces={recentWorkspaces}
@@ -761,7 +1029,16 @@ export function App() {
             demoStarting={demoStarting}
             onStartDemo={() => void startSubagentDemo()}
           />
-          <div className="messages">
+          <div
+            className="messages"
+            ref={messages}
+            onScroll={() => {
+              const element = messages.current;
+              if (!element) return;
+              followMessages.current =
+                element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+            }}
+          >
             {turns.hasNextPage && !newTaskDraft ? (
               <button
                 className="history-load"
@@ -776,6 +1053,15 @@ export function App() {
                 {turns.isFetchingNextPage ? "正在加载" : "加载更早记录"}
               </button>
             ) : null}
+            {turns.isError || subagentRuns.isError ? (
+              <InlineQueryError
+                message="对话记录加载失败"
+                onRetry={() => {
+                  void turns.refetch();
+                  void subagentRuns.refetch();
+                }}
+              />
+            ) : null}
             {visibleTurns.length === 0 && !running && agentRuns.length === 0 ? (
               <EmptyConversation />
             ) : null}
@@ -786,6 +1072,7 @@ export function App() {
                   selected={selectedTurn?.turn_id === turn.turn_id}
                   onInspect={() => setSelectedTurn(turn)}
                   onRestore={() => setRestoreTurn(turn)}
+                  restoreDisabled={workspaceBusy}
                 />
                 {agentRuns
                   .filter((run) => run.turn_id === turn.turn_id)
@@ -811,6 +1098,7 @@ export function App() {
                 selected={false}
                 onInspect={() => undefined}
                 onRestore={() => undefined}
+                restoreDisabled
               />
             ) : null}
             {running ? (
@@ -819,6 +1107,7 @@ export function App() {
                 events={events}
                 operationId={operationId}
                 toolRuns={visibleToolRuns}
+                connectionState={runtime.connectionState}
               />
             ) : null}
             {pendingRuns.map((run) => (
@@ -875,6 +1164,18 @@ export function App() {
             fileContent={fileContent.data}
             spans={trace.data?.spans ?? []}
             traceLoading={trace.isLoading}
+            diffError={diff.isError || diffContent.isError}
+            filesError={files.isError || fileContent.isError}
+            traceError={trace.isError}
+            onRetryDiff={() => {
+              void diff.refetch();
+              void diffContent.refetch();
+            }}
+            onRetryFiles={() => {
+              void files.refetch();
+              void fileContent.refetch();
+            }}
+            onRetryTrace={() => void trace.refetch()}
             selectedTurn={selectedTurn}
           />
           <InspectorFooter workspace={workspace.data} />
@@ -884,6 +1185,7 @@ export function App() {
       {restoreTurn ? (
         <RestoreDialog
           turn={restoreTurn}
+          disabled={workspaceBusy}
           onCancel={() => setRestoreTurn(null)}
           onConfirm={() => void restore()}
         />
@@ -1010,7 +1312,7 @@ function Sidebar({
   open,
   sessions,
   activeId,
-  runningIds,
+  sessionStatuses,
   disabled,
   workspaceName,
   workspaces,
@@ -1026,7 +1328,7 @@ function Sidebar({
   open: boolean;
   sessions: Session[];
   activeId?: string;
-  runningIds: Set<string>;
+  sessionStatuses: Map<string, string>;
   disabled: boolean;
   workspaceName: string;
   workspaces: Workspaces["recent"];
@@ -1077,27 +1379,35 @@ function Sidebar({
           </button>
         </div>
         <div className="session-list">
-          {sessions.map((session) => (
-            <button
-              key={session.session_id}
-              className={`session-row ${session.session_id === activeId ? "active" : ""}`}
-              onClick={() => onSelect(session.session_id)}
-              disabled={disabled}
-            >
-              <MessageSquare size={15} />
-              <span>
-                <strong>{session.title}</strong>
-                <small>
-                  {session.turn_count} 轮 · {relativeTime(session.created_at)}
-                </small>
-              </span>
-              {runningIds.has(session.session_id) ? (
-                <LoaderCircle size={13} className="spin" />
-              ) : session.session_id === activeId ? (
-                <CircleDot size={13} />
-              ) : null}
-            </button>
-          ))}
+          {sessions.map((session) => {
+            const sessionStatus = sessionStatuses.get(session.session_id);
+            return (
+              <button
+                key={session.session_id}
+                className={`session-row ${session.session_id === activeId ? "active" : ""}`}
+                onClick={() => onSelect(session.session_id)}
+                disabled={disabled}
+              >
+                <MessageSquare size={15} />
+                <span>
+                  <strong>{session.title}</strong>
+                  <small>
+                    {session.turn_count} 轮 · {relativeTime(session.created_at)}
+                    {sessionStatus ? ` · ${operationStatusLabel(sessionStatus)}` : ""}
+                  </small>
+                </span>
+                {sessionStatus ? (
+                  <LoaderCircle
+                    size={13}
+                    className="spin"
+                    aria-label={operationStatusLabel(sessionStatus)}
+                  />
+                ) : session.session_id === activeId ? (
+                  <CircleDot size={13} />
+                ) : null}
+              </button>
+            );
+          })}
           {hasMore ? (
             <button
               className="session-load-more"
@@ -1547,11 +1857,13 @@ function TurnBlock({
   selected,
   onInspect,
   onRestore,
+  restoreDisabled,
 }: {
   turn: Turn;
   selected: boolean;
   onInspect: () => void;
   onRestore: () => void;
+  restoreDisabled: boolean;
 }) {
   const cancelled = turn.status === "cancelled";
   return (
@@ -1592,7 +1904,15 @@ function TurnBlock({
                   <Play size={13} /> 执行详情
                 </button>
               ) : null}
-              <button onClick={onRestore}>
+              <button
+                onClick={onRestore}
+                disabled={restoreDisabled}
+                title={
+                  restoreDisabled
+                    ? "工作区有任务正在运行，暂时不能恢复"
+                    : "恢复到此轮"
+                }
+              >
                 <RotateCcw size={13} /> 恢复到此轮
               </button>
               <code>{turn.snapshot_oid.slice(0, 8)}</code>
@@ -1609,11 +1929,13 @@ function RunningBlock({
   events,
   operationId,
   toolRuns,
+  connectionState,
 }: {
   text: string;
   events: StreamEvent[];
   operationId: string | null;
   toolRuns: ToolRunView[];
+  connectionState: StreamConnectionState;
 }) {
   const steps = events.filter((event) =>
     [
@@ -1634,7 +1956,8 @@ function RunningBlock({
           <div className="message-meta">
             <strong>Agent</strong>
             <span className="running-label">
-              <LoaderCircle size={12} className="spin" /> 正在处理
+              <LoaderCircle size={12} className="spin" />
+              {connectionState === "reconnecting" ? "正在重连" : "正在处理"}
             </span>
           </div>
           {text ? (
@@ -1717,8 +2040,12 @@ function ToolRunCard({ run }: { run: ToolRunView }) {
         ) : null}
       </div>
       <pre>{detail}</pre>
-      {run.execution_group_id ? (
-        <footer title={run.execution_group_id}>组 {run.execution_group_id}</footer>
+      {run.execution_group_id || run.output_truncated ? (
+        <footer title={run.execution_group_id ?? undefined}>
+          {run.output_truncated ? "输出已截断" : null}
+          {run.output_truncated && run.execution_group_id ? " · " : null}
+          {run.execution_group_id ? `组 ${run.execution_group_id}` : null}
+        </footer>
       ) : null}
     </article>
   );
@@ -1805,6 +2132,12 @@ function Inspector({
   fileContent,
   spans,
   traceLoading,
+  diffError,
+  filesError,
+  traceError,
+  onRetryDiff,
+  onRetryFiles,
+  onRetryTrace,
   selectedTurn,
 }: {
   tab: InspectorTab;
@@ -1818,6 +2151,12 @@ function Inspector({
   fileContent?: FileContent;
   spans: TraceSpan[];
   traceLoading: boolean;
+  diffError: boolean;
+  filesError: boolean;
+  traceError: boolean;
+  onRetryDiff: () => void;
+  onRetryFiles: () => void;
+  onRetryTrace: () => void;
   selectedTurn: Turn | null;
 }) {
   const [bottomTab, setBottomTab] = useState<"terminal" | "problems">("terminal");
@@ -1840,10 +2179,14 @@ function Inspector({
             预览 <small>未开放</small>
           </button>
         </div>
-        {tab === "changes" ? (
+        {tab === "changes" && diffError ? (
+          <InlineQueryError message="Diff 加载失败" onRetry={onRetryDiff} />
+        ) : tab === "changes" ? (
           <DiffViewer files={diffFiles} active={activeDiff} onSelect={onDiff} />
         ) : null}
-        {tab === "files" ? (
+        {tab === "files" && filesError ? (
+          <InlineQueryError message="文件内容加载失败" onRetry={onRetryFiles} />
+        ) : tab === "files" ? (
           <FileViewer
             files={files}
             selected={selectedFile}
@@ -1875,7 +2218,9 @@ function Inspector({
             问题 <span>0</span>
           </button>
         </div>
-        {bottomTab === "terminal" ? (
+        {bottomTab === "terminal" && traceError ? (
+          <InlineQueryError message="执行详情加载失败" onRetry={onRetryTrace} />
+        ) : bottomTab === "terminal" ? (
           <CommandOutput commands={commands} loading={traceLoading} selectedTurn={selectedTurn} />
         ) : (
           <Unavailable
@@ -1923,6 +2268,11 @@ function DiffViewer({
         <div className="code-header">
           <span>{active?.path}</span>
           <div>
+            {active?.truncated ? (
+              <small className="truncation-label">
+                <AlertCircle size={11} /> 仅显示前 1 MiB
+              </small>
+            ) : null}
             <span className="added">+{active?.additions}</span>
             <span className="deleted">-{active?.deletions}</span>
           </div>
@@ -1982,7 +2332,14 @@ function FileViewer({
           <>
             <div className="code-header">
               <span>{content.path}</span>
-              <small>{formatBytes(content.byte_size)}</small>
+              <div>
+                {content.truncated ? (
+                  <small className="truncation-label">
+                    <AlertCircle size={11} /> 内容已截断
+                  </small>
+                ) : null}
+                <small>{formatBytes(content.byte_size)}</small>
+              </div>
             </div>
             {content.binary ? (
               <Unavailable icon={Files} title="二进制文件" detail="此文件不能作为文本预览。" />
@@ -2030,6 +2387,9 @@ function CommandOutput({
               {span.status === "ok" ? <Check size={12} /> : <X size={12} />}
             </span>
             <strong>{span.name}</strong>
+            {span.attributes_json_truncated ? (
+              <span className="truncation-label">输出已截断</span>
+            ) : null}
             <time>{duration(span.started_at, span.ended_at)}</time>
           </summary>
           <pre>{prettyAttributes(span.attributes_json)}</pre>
@@ -2115,10 +2475,12 @@ function ApprovalPanel({
 
 function RestoreDialog({
   turn,
+  disabled,
   onCancel,
   onConfirm,
 }: {
   turn: Turn;
+  disabled: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -2131,7 +2493,11 @@ function RestoreDialog({
         <div>
           <span className="eyebrow">恢复历史</span>
           <h2>恢复到第 {turn.turn_number} 轮？</h2>
-          <p>系统会创建新 timeline。旧 timeline 保持只读，ignored 文件和外部副作用不会恢复。</p>
+          <p>
+            {disabled
+              ? "工作区有任务正在运行。请等待任务结束后再恢复。"
+              : "系统会创建新 timeline。旧 timeline 保持只读，ignored 文件和外部副作用不会恢复。"}
+          </p>
         </div>
         <div className="restore-target">
           <strong>{turn.user_text}</strong>
@@ -2139,7 +2505,7 @@ function RestoreDialog({
         </div>
         <div className="modal-actions">
           <button className="secondary-button" onClick={onCancel}>取消</button>
-          <button className="danger-button" onClick={onConfirm}>
+          <button className="danger-button" onClick={onConfirm} disabled={disabled}>
             <RotateCcw size={15} /> 确认恢复
           </button>
         </div>
@@ -2510,6 +2876,24 @@ function StatusBar({ host, workspace }: { host: HostStatus; workspace?: Workspac
   );
 }
 
+function InlineQueryError({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="inline-query-error" role="alert">
+      <AlertCircle size={16} />
+      <span>{message}</span>
+      <button className="secondary-button" onClick={onRetry}>
+        重试
+      </button>
+    </div>
+  );
+}
+
 function Unavailable({
   icon: Icon,
   title,
@@ -2582,6 +2966,18 @@ function effectLabel(effect: string) {
   if (effect === "workspace_write") return "工作区";
   if (effect === "external") return "外部服务";
   return effect;
+}
+
+function operationStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    queued: "排队中",
+    running: "执行中",
+    waiting_approval: "等待审批",
+    cancel_requested: "取消中",
+    cancelling: "取消中",
+    committing: "提交中",
+  };
+  return labels[status] ?? status;
 }
 
 function duration(start: string, end: string | null) {

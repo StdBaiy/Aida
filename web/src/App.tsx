@@ -8,6 +8,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  Command,
   File,
   FileCode2,
   FileDiff,
@@ -40,6 +41,7 @@ import {
 } from "lucide-react";
 import {
   FormEvent,
+  ReactNode,
   SetStateAction,
   useEffect,
   useMemo,
@@ -56,6 +58,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Approval,
+  ContextUsage,
   DiffFile,
   FileContent,
   HostStatus,
@@ -80,8 +83,16 @@ import {
   subscribe,
 } from "./lib/api";
 
-type InspectorTab = "changes" | "files" | "preview";
+type InspectorTab = "changes" | "files" | "preview" | "commands";
 type MobileView = "tasks" | "chat" | "workspace";
+type ShortcutResult = {
+  id: string;
+  command: string;
+  status: "running" | "success" | "error";
+  createdAt: string;
+  data?: unknown;
+  error?: string;
+};
 type SessionRuntimeState = {
   draft: string;
   pendingTurn: Turn | null;
@@ -94,10 +105,22 @@ type SessionRuntimeState = {
   eventCursors: Record<string, number>;
   connectionState: StreamConnectionState;
   approval: Approval | null;
+  compressionState: "idle" | "preparing" | "generating" | "applying";
+  shortcutResults: ShortcutResult[];
   error: string;
 };
 
 const NEW_TASK_RUNTIME_KEY = "__new_task__";
+const SHORTCUT_COMMANDS = [
+  { name: "/help", usage: "/help", description: "查看 WebUI 快捷指令" },
+  { name: "/status", usage: "/status", description: "查看 Host 与当前会话状态" },
+  { name: "/context", usage: "/context", description: "查看上下文窗口占用" },
+  { name: "/history", usage: "/history", description: "查看最近提交的轮次" },
+  { name: "/turn", usage: "/turn [turn]", description: "查看指定或当前轮次上下文" },
+  { name: "/trace", usage: "/trace [turn]", description: "查看指定或当前轮次追踪" },
+  { name: "/compact", usage: "/compact", description: "在空闲边界压缩上下文" },
+  { name: "/restore", usage: "/restore <turn>", description: "打开历史轮次恢复确认" },
+] as const;
 
 function createSessionRuntime(): SessionRuntimeState {
   return {
@@ -112,6 +135,8 @@ function createSessionRuntime(): SessionRuntimeState {
     eventCursors: {},
     connectionState: "closed",
     approval: null,
+    compressionState: "idle",
+    shortcutResults: [],
     error: "",
   };
 }
@@ -261,6 +286,12 @@ export function App() {
     getNextPageParam: (page) => page.next_before_turn_number ?? undefined,
     enabled: Boolean(sessionId) && !newTaskDraft,
   });
+  const contextUsage = useQuery({
+    queryKey: ["context", sessionId],
+    queryFn: () =>
+      request<ContextUsage>(`/api/v1/sessions/${sessionId}/context`),
+    enabled: Boolean(sessionId) && !newTaskDraft,
+  });
   const workspace = useQuery({
     queryKey: ["workspace-status"],
     queryFn: () => request<WorkspaceStatus>("/api/v1/workspace/status"),
@@ -324,6 +355,12 @@ export function App() {
   };
 
   const handleEvent = (targetSessionId: string, event: StreamEvent) => {
+    if (event.type === "context.window_usage") {
+      queryClient.setQueryData<ContextUsage>(
+        ["context", targetSessionId],
+        event.data as ContextUsage,
+      );
+    }
     if (event.type === "assistant.delta") {
       streamBuffers.current.set(
         targetSessionId,
@@ -358,6 +395,19 @@ export function App() {
         };
       }
       if (event.type === "approval.resolved") next.approval = null;
+      if (event.type === "context.compression.started") {
+        next.compressionState = "preparing";
+      }
+      if (event.type === "context.compression.progress") {
+        next.compressionState =
+          event.data.phase === "applying" ? "applying" : "generating";
+      }
+      if (
+        event.type === "context.compression.completed" ||
+        event.type === "context.compression.failed"
+      ) {
+        next.compressionState = "idle";
+      }
       if (event.type.startsWith("tool.")) {
         const runId = String(event.data.run_id ?? "");
         if (runId) {
@@ -563,9 +613,159 @@ export function App() {
     localStorage.setItem("coding-agent.inspector-open", String(inspectorOpen));
   }, [inspectorOpen]);
 
+  const executeShortcut = async (input: string) => {
+    const [command, ...args] = input.trim().split(/\s+/);
+    const resultId = crypto.randomUUID();
+    const resultKey = runtimeKey;
+    const targetSessionId = newTaskDraft ? null : sessionId;
+    const createdAt = new Date().toISOString();
+    const pendingResult: ShortcutResult = {
+      id: resultId,
+      command: input.trim(),
+      status: "running",
+      createdAt,
+    };
+    updateRuntime(resultKey, (current) => ({
+      ...current,
+      shortcutResults: [
+        pendingResult,
+        ...current.shortcutResults,
+      ].slice(0, 30),
+    }));
+    setDraft("");
+    setInspectorOpen(true);
+    setInspectorTab("commands");
+    setMobileView("workspace");
+
+    const complete = (update: Pick<ShortcutResult, "status" | "data" | "error">) => {
+      updateRuntime(resultKey, (current) => ({
+        ...current,
+        shortcutResults: current.shortcutResults.map((item) =>
+          item.id === resultId ? { ...item, ...update } : item,
+        ),
+      }));
+    };
+    const requireSession = () => {
+      if (!targetSessionId) {
+        throw new Error("当前尚未创建会话，请先发送一个任务。");
+      }
+      return targetSessionId;
+    };
+    const loadTurns = () =>
+      request<TurnPage>(
+        `/api/v1/sessions/${requireSession()}/turns?limit=100`,
+      );
+    const resolveTurn = async (argument?: string) => {
+      if (!argument && selectedTurn) return selectedTurn;
+      const page = await loadTurns();
+      if (!argument) {
+        const latest = page.turns.at(-1);
+        if (latest) return latest;
+        throw new Error("当前会话还没有可查看的轮次。");
+      }
+      const turnNumber = Number(argument);
+      if (!Number.isInteger(turnNumber) || turnNumber < 1) {
+        throw new Error("轮次必须是大于 0 的整数。");
+      }
+      const turn = page.turns.find((item) => item.turn_number === turnNumber);
+      if (!turn) throw new Error(`未找到轮次 ${turnNumber}。`);
+      return turn;
+    };
+
+    try {
+      if (command === "/help") {
+        complete({
+          status: "success",
+          data: {
+            commands: SHORTCUT_COMMANDS.map(({ usage, description }) => ({
+              usage,
+              description,
+            })),
+          },
+        });
+      } else if (command === "/status") {
+        const current = await request<HostStatus>("/api/v1/status");
+        const { csrf_token: _csrfToken, ...safeStatus } = current;
+        complete({ status: "success", data: safeStatus });
+      } else if (command === "/context") {
+        const data = await request<ContextUsage>(
+          `/api/v1/sessions/${requireSession()}/context`,
+        );
+        complete({ status: "success", data });
+      } else if (command === "/history") {
+        const data = await loadTurns();
+        complete({
+          status: "success",
+          data: {
+            timeline_id: data.timeline_id,
+            turns: data.turns,
+            truncated: data.next_before_turn_number !== null,
+          },
+        });
+      } else if (command === "/turn") {
+        const turn = await resolveTurn(args[0]);
+        const data = await request<Record<string, unknown>>(
+          `/api/v1/sessions/${requireSession()}/turns/${turn.turn_number}/context`,
+        );
+        complete({ status: "success", data });
+      } else if (command === "/trace") {
+        const turn = await resolveTurn(args[0]);
+        setSelectedTurn(turn);
+        const data = await request<{ spans: TraceSpan[] }>(
+          `/api/v1/turns/${turn.turn_id}/trace`,
+        );
+        complete({
+          status: "success",
+          data: { turn_number: turn.turn_number, ...data },
+        });
+      } else if (command === "/compact") {
+        if (!status.data?.timeline_id) throw new Error("当前时间线不可用。");
+        const operation = await post<{ operation_id: string }>(
+          `/api/v1/sessions/${requireSession()}/context/compact`,
+          {
+            expected_timeline_id: status.data.timeline_id,
+            client_request_id: crypto.randomUUID(),
+          },
+        );
+        followOperation(requireSession(), operation.operation_id);
+        complete({
+          status: "success",
+          data: {
+            operation_id: operation.operation_id,
+            status: "accepted",
+            message: "上下文压缩已提交，进度将在对话区同步。",
+          },
+        });
+      } else if (command === "/restore") {
+        if (!args[0]) throw new Error("用法：/restore <turn>");
+        const turn = await resolveTurn(args[0]);
+        setRestoreTurn(turn);
+        complete({
+          status: "success",
+          data: {
+            turn_number: turn.turn_number,
+            status: "confirmation_required",
+            message: "已打开恢复确认窗口。",
+          },
+        });
+      } else {
+        throw new Error(`未知指令 ${command}，输入 /help 查看可用指令。`);
+      }
+    } catch (cause) {
+      complete({
+        status: "error",
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
+  };
+
   const sendTurn = async (event: FormEvent) => {
     event.preventDefault();
     const message = draft.trim();
+    if (message.startsWith("/")) {
+      await executeShortcut(message);
+      return;
+    }
     if (!message || !sessionId || !status.data?.timeline_id || running) {
       return;
     }
@@ -686,6 +886,23 @@ export function App() {
       await post(`/api/v1/operations/${operationId}/cancel`, {});
     } catch (cause) {
       setCancelling(false);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const compactContext = async () => {
+    if (!sessionId || !status.data?.timeline_id || running) return;
+    setError("");
+    try {
+      const operation = await post<{ operation_id: string }>(
+        `/api/v1/sessions/${sessionId}/context/compact`,
+        {
+          expected_timeline_id: status.data.timeline_id,
+          client_request_id: crypto.randomUUID(),
+        },
+      );
+      followOperation(sessionId, operation.operation_id);
+    } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
@@ -843,6 +1060,12 @@ export function App() {
         subagent_model_call_limit: values.subagent_model_call_limit,
         command_timeout_seconds: values.command_timeout_seconds,
         max_parallel_sessions: values.max_parallel_sessions,
+        context_auto_compact_ratio: values.context_auto_compact_ratio,
+        context_recent_user_inputs_max_tokens:
+          values.context_recent_user_inputs_max_tokens,
+        context_summary_max_tokens: values.context_summary_max_tokens,
+        context_compaction_enabled: values.context_compaction_enabled,
+        context_window_tokens: values.context_window_tokens,
       });
       queryClient.setQueryData(["settings"], updated);
       queryClient.setQueryData<HostStatus>(["status"], (current) =>
@@ -923,6 +1146,23 @@ export function App() {
         .reverse()
         .flatMap((page) => page.turns)
         .filter((turn) => turn.user_text || turn.assistant_text);
+  const timelineItems = [
+    ...visibleTurns.map((turn) => ({
+      kind: "turn" as const,
+      timestamp: turn.created_at,
+      turn,
+    })),
+    ...(newTaskDraft ? [] : (turns.data?.pages[0]?.notices ?? [])).map(
+      (notice) => ({
+        kind: "notice" as const,
+        timestamp: notice.created_at,
+        notice,
+      }),
+    ),
+  ].sort(
+    (left, right) =>
+      Date.parse(left.timestamp) - Date.parse(right.timestamp),
+  );
   const agentRuns = newTaskDraft ? [] : (subagentRuns.data?.runs ?? []);
   const visibleTurnIds = new Set(visibleTurns.map((turn) => turn.turn_id));
   const unboundRuns = agentRuns.filter((run) => run.turn_id === null);
@@ -1027,6 +1267,9 @@ export function App() {
           <ConversationHeader
             running={running}
             turnCount={visibleTurns.length}
+            contextUsage={contextUsage.data ?? null}
+            compressionState={runtime.compressionState}
+            onCompact={() => void compactContext()}
             demoRunning={agentRuns.some((run) => run.status === "running")}
             demoStarting={demoStarting}
             onStartDemo={() => void startSubagentDemo()}
@@ -1067,26 +1310,34 @@ export function App() {
             {visibleTurns.length === 0 && !running && agentRuns.length === 0 ? (
               <EmptyConversation />
             ) : null}
-            {visibleTurns.map((turn) => (
-              <div className="turn-group" key={turn.turn_id}>
-                <TurnBlock
-                  turn={turn}
-                  selected={selectedTurn?.turn_id === turn.turn_id}
-                  onInspect={() => setSelectedTurn(turn)}
-                  onRestore={() => setRestoreTurn(turn)}
-                  restoreDisabled={workspaceBusy}
-                />
-                {agentRuns
-                  .filter((run) => run.turn_id === turn.turn_id)
-                  .map((run) => (
-                    <SubagentDemoPanel
-                      demo={run}
-                      key={run.run_id}
-                      onCancel={(taskId) => void cancelSubagentTask(taskId)}
-                    />
-                  ))}
-              </div>
-            ))}
+            {timelineItems.map((item) =>
+              item.kind === "turn" ? (
+                <div className="turn-group" key={item.turn.turn_id}>
+                  <TurnBlock
+                    turn={item.turn}
+                    selected={selectedTurn?.turn_id === item.turn.turn_id}
+                    onInspect={() => setSelectedTurn(item.turn)}
+                    onRestore={() => setRestoreTurn(item.turn)}
+                    restoreDisabled={workspaceBusy}
+                  />
+                  {agentRuns
+                    .filter((run) => run.turn_id === item.turn.turn_id)
+                    .map((run) => (
+                      <SubagentDemoPanel
+                        demo={run}
+                        key={run.run_id}
+                        onCancel={(taskId) => void cancelSubagentTask(taskId)}
+                      />
+                    ))}
+                </div>
+              ) : (
+                <div className="system-notice" key={item.notice.notice_id}>
+                  <History size={13} />
+                  <span>{item.notice.text}</span>
+                  <time>{formatTime(item.notice.created_at)}</time>
+                </div>
+              ),
+            )}
             {unboundRuns.map((run) => (
               <SubagentDemoPanel
                 demo={run}
@@ -1179,6 +1430,7 @@ export function App() {
             }}
             onRetryTrace={() => void trace.refetch()}
             selectedTurn={selectedTurn}
+            shortcutResults={runtime.shortcutResults}
           />
           <InspectorFooter workspace={workspace.data} />
         </aside>
@@ -1439,12 +1691,18 @@ function Sidebar({
 function ConversationHeader({
   running,
   turnCount,
+  contextUsage,
+  compressionState,
+  onCompact,
   demoRunning,
   demoStarting,
   onStartDemo,
 }: {
   running: boolean;
   turnCount: number;
+  contextUsage: ContextUsage | null;
+  compressionState: SessionRuntimeState["compressionState"];
+  onCompact: () => void;
   demoRunning: boolean;
   demoStarting: boolean;
   onStartDemo: () => void;
@@ -1457,6 +1715,12 @@ function ConversationHeader({
           {running ? <LoaderCircle size={12} className="spin" /> : <Check size={12} />}
           {running ? "执行中" : "就绪"}
         </span>
+        <ContextRing
+          usage={contextUsage}
+          compressionState={compressionState}
+          disabled={running}
+          onCompact={onCompact}
+        />
       </div>
       <button
         className="secondary-button demo-launch"
@@ -1471,6 +1735,74 @@ function ConversationHeader({
         {demoRunning ? "双 Agent 执行中" : demoStarting ? "正在启动" : "运行双 Agent Demo"}
       </button>
     </div>
+  );
+}
+
+function ContextRing({
+  usage,
+  compressionState,
+  disabled,
+  compact = false,
+  onCompact,
+}: {
+  usage: ContextUsage | null;
+  compressionState: SessionRuntimeState["compressionState"];
+  disabled: boolean;
+  compact?: boolean;
+  onCompact: () => void;
+}) {
+  const usedTokens = Number(usage?.used_tokens ?? 0);
+  const maxTokens = Number(usage?.max_tokens ?? 0);
+  const rawRatio = Number(
+    usage?.usage_ratio ?? (maxTokens > 0 ? usedTokens / maxTokens : 0),
+  );
+  const ratio = Number.isFinite(rawRatio)
+    ? Math.max(0, Math.min(1, rawRatio))
+    : 0;
+  const available =
+    usage !== null &&
+    Number.isFinite(usedTokens) &&
+    Number.isFinite(maxTokens) &&
+    maxTokens > 0;
+  const circumference = 2 * Math.PI * 10;
+  const tone = ratio >= 0.9 ? "danger" : ratio >= 0.8 ? "warning" : "healthy";
+  const title = available
+    ? `上下文 ${usedTokens.toLocaleString()} / ${maxTokens.toLocaleString()} tokens (${(
+        ratio * 100
+      ).toFixed(1)}%)`
+    : "上下文计量尚不可用";
+  const compressing = compressionState !== "idle";
+  return (
+    <button
+      className={`context-ring ${tone} ${compact ? "compact" : ""} ${
+        compressing ? "compressing" : ""
+      }`}
+      title={
+        compact
+          ? title
+          : disabled
+            ? `${title}；当前 turn 结束后可手动压缩`
+            : `${title}；点击立即压缩`
+      }
+      aria-label={title}
+      disabled={disabled || compressing || !available}
+      onClick={onCompact}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle className="context-ring-track" cx="12" cy="12" r="10" />
+        <circle
+          className="context-ring-value"
+          cx="12"
+          cy="12"
+          r="10"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - ratio)}
+        />
+      </svg>
+      <span className="context-ring-percent">
+        {available ? `${Math.round(ratio * 100)}%` : "--"}
+      </span>
+    </button>
   );
 }
 
@@ -1583,6 +1915,13 @@ function SubagentCard({
           {running ? <LoaderCircle size={12} className="spin" /> : null}
           {taskStatusLabel(task.status)}
         </span>
+        <ContextRing
+          usage={activeAttempt?.context_usage ?? null}
+          compressionState="idle"
+          disabled
+          compact
+          onCompact={() => undefined}
+        />
         {cancellable ? (
           <button
             className="icon-button compact subagent-cancel"
@@ -1896,6 +2235,11 @@ function TurnBlock({
                 {cancelled ? <X size={12} /> : <Check size={12} />}
                 {cancelled ? " 已取消" : " 已完成"}
               </span>
+              {turn.duration_ms != null ? (
+                <small className="turn-duration">
+                  {formatTurnDuration(turn.duration_ms)}
+                </small>
+              ) : null}
             </div>
             {turn.assistant_text ? (
               <MarkdownMessage>{turn.assistant_text}</MarkdownMessage>
@@ -1946,6 +2290,8 @@ function RunningBlock({
       "step.completed",
       "approval.required",
       "context.window_usage",
+      "context.compression.started",
+      "context.compression.progress",
     ].includes(event.type),
   );
   return (
@@ -2068,14 +2414,98 @@ function Composer({
   onSubmit: (event: FormEvent) => void;
   onCancel: () => void;
 }) {
+  const [activeSuggestion, setActiveSuggestion] = useState(0);
+  const [suggestionsDismissed, setSuggestionsDismissed] = useState(false);
+  const commandQuery = value.startsWith("/") ? value.trimStart().split(/\s+/, 1)[0] : "";
+  const suggestions = commandQuery
+    ? SHORTCUT_COMMANDS.filter((command) => command.name.startsWith(commandQuery))
+    : [];
+  const showSuggestions =
+    !disabled &&
+    !suggestionsDismissed &&
+    value.startsWith("/") &&
+    !value.includes("\n") &&
+    suggestions.length > 0;
+
+  useEffect(() => {
+    setActiveSuggestion(0);
+    setSuggestionsDismissed(false);
+  }, [commandQuery]);
+
+  const applySuggestion = (index: number) => {
+    const suggestion = suggestions[index];
+    if (!suggestion) return;
+    onChange(
+      suggestion.usage.includes(" ")
+        ? `${suggestion.name} `
+        : suggestion.name,
+    );
+  };
+
   return (
     <form className="composer-wrap" onSubmit={onSubmit}>
+      {showSuggestions ? (
+        <div className="slash-command-menu" role="listbox" aria-label="快捷指令">
+          {suggestions.map((command, index) => (
+            <button
+              type="button"
+              role="option"
+              aria-selected={index === activeSuggestion}
+              className={index === activeSuggestion ? "active" : ""}
+              key={command.name}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => applySuggestion(index)}
+            >
+              <span className="slash-command-icon">
+                <Command size={14} />
+              </span>
+              <strong>{command.usage}</strong>
+              <small>{command.description}</small>
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div className={`composer ${disabled ? "disabled" : ""}`}>
         <textarea
           value={value}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => {
+            setSuggestionsDismissed(false);
+            onChange(event.target.value);
+          }}
           onKeyDown={(event) => {
+            if (showSuggestions && event.key === "ArrowDown") {
+              event.preventDefault();
+              setActiveSuggestion((current) => (current + 1) % suggestions.length);
+              return;
+            }
+            if (showSuggestions && event.key === "ArrowUp") {
+              event.preventDefault();
+              setActiveSuggestion(
+                (current) => (current - 1 + suggestions.length) % suggestions.length,
+              );
+              return;
+            }
+            if (showSuggestions && event.key === "Escape") {
+              event.preventDefault();
+              setSuggestionsDismissed(true);
+              return;
+            }
+            if (showSuggestions && event.key === "Tab") {
+              event.preventDefault();
+              applySuggestion(activeSuggestion);
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              const suggestion = suggestions[activeSuggestion];
+              const exactCommand =
+                suggestion &&
+                (value.trim() === suggestion.name ||
+                  value.trim().startsWith(`${suggestion.name} `));
+              if (showSuggestions && suggestion && !exactCommand) {
+                event.preventDefault();
+                applySuggestion(activeSuggestion);
+                return;
+              }
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }
@@ -2141,6 +2571,7 @@ function Inspector({
   onRetryFiles,
   onRetryTrace,
   selectedTurn,
+  shortcutResults,
 }: {
   tab: InspectorTab;
   onTab: (tab: InspectorTab) => void;
@@ -2160,6 +2591,7 @@ function Inspector({
   onRetryFiles: () => void;
   onRetryTrace: () => void;
   selectedTurn: Turn | null;
+  shortcutResults: ShortcutResult[];
 }) {
   const [bottomTab, setBottomTab] = useState<"terminal" | "problems">("terminal");
   const commands = useMemo(() => spans.filter((span) => span.kind === "tool"), [spans]);
@@ -2179,6 +2611,13 @@ function Inspector({
             title="安全预览将在后续版本提供"
           >
             预览 <small>未开放</small>
+          </button>
+          <button
+            className={tab === "commands" ? "active" : ""}
+            onClick={() => onTab("commands")}
+          >
+            <Command size={13} /> 指令
+            {shortcutResults.length ? <span>{shortcutResults.length}</span> : null}
           </button>
         </div>
         {tab === "changes" && diffError ? (
@@ -2203,6 +2642,7 @@ function Inspector({
             detail="需要隔离沙箱与独立 Origin 后才能安全执行仓库应用。"
           />
         ) : null}
+        {tab === "commands" ? <ShortcutResults results={shortcutResults} /> : null}
       </section>
       <div className="panel-resizer" />
       <section className="inspector-bottom">
@@ -2397,6 +2837,95 @@ function CommandOutput({
           <pre>{prettyAttributes(span.attributes_json)}</pre>
         </details>
       ))}
+    </div>
+  );
+}
+
+function ShortcutResults({ results }: { results: ShortcutResult[] }) {
+  if (!results.length) {
+    return (
+      <Unavailable
+        icon={Command}
+        title="暂无指令结果"
+        detail="在输入框键入 / 可查看和执行快捷指令。"
+      />
+    );
+  }
+  return (
+    <div className="shortcut-results">
+      {results.map((result, index) => (
+        <article className={`shortcut-result ${result.status}`} key={result.id}>
+          <header>
+            <span className="shortcut-result-status">
+              {result.status === "running" ? (
+                <LoaderCircle size={14} className="spin" />
+              ) : result.status === "success" ? (
+                <Check size={14} />
+              ) : (
+                <X size={14} />
+              )}
+            </span>
+            <code>{result.command}</code>
+            <time>{formatTime(result.createdAt)}</time>
+          </header>
+          {result.error ? (
+            <div className="shortcut-result-error">{result.error}</div>
+          ) : result.status === "running" ? (
+            <div className="shortcut-result-loading">正在执行指令</div>
+          ) : (
+            <div className="json-viewer">
+              <JsonNode value={result.data} depth={0} initiallyOpen={index === 0} />
+            </div>
+          )}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function JsonNode({
+  value,
+  name,
+  depth,
+  initiallyOpen = false,
+}: {
+  value: unknown;
+  name?: string;
+  depth: number;
+  initiallyOpen?: boolean;
+}): ReactNode {
+  if (value !== null && typeof value === "object") {
+    const entries = Array.isArray(value)
+      ? value.map((item, index) => [String(index), item] as const)
+      : Object.entries(value as Record<string, unknown>);
+    const label = Array.isArray(value)
+      ? `Array(${entries.length})`
+      : `Object(${entries.length})`;
+    return (
+      <details className="json-node" open={initiallyOpen || depth < 1}>
+        <summary>
+          {name !== undefined ? <span className="json-key">{name}</span> : null}
+          <span className="json-kind">{label}</span>
+        </summary>
+        <div className="json-children">
+          {entries.length ? (
+            entries.map(([key, child]) => (
+              <JsonNode value={child} name={key} depth={depth + 1} key={key} />
+            ))
+          ) : (
+            <span className="json-empty">empty</span>
+          )}
+        </div>
+      </details>
+    );
+  }
+  const kind = value === null ? "null" : typeof value;
+  const rendered =
+    typeof value === "string" ? `"${value}"` : value === undefined ? "undefined" : String(value);
+  return (
+    <div className="json-leaf">
+      {name !== undefined ? <span className="json-key">{name}</span> : null}
+      <span className={`json-value ${kind}`}>{rendered}</span>
     </div>
   );
 }
@@ -2734,7 +3263,7 @@ function SettingsDialog({
               <span>主 Agent 模型调用上限</span>
               <div className="number-field">
                 <input
-                  value={form.main_agent_model_call_limit}
+                  value={form.main_agent_model_call_limit ?? 20}
                   onChange={(event) =>
                     setForm({
                       ...form,
@@ -2753,7 +3282,7 @@ function SettingsDialog({
               <span>子 Agent 模型调用上限</span>
               <div className="number-field">
                 <input
-                  value={form.subagent_model_call_limit}
+                  value={form.subagent_model_call_limit ?? 20}
                   onChange={(event) =>
                     setForm({
                       ...form,
@@ -2805,6 +3334,78 @@ function SettingsDialog({
                 />
                 <span>个</span>
               </div>
+            </label>
+            <label className="setting-field">
+              <span>自动压缩阈值</span>
+              <div className="number-field">
+                <input
+                  value={Math.round((form.context_auto_compact_ratio ?? 0.8) * 100)}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      context_auto_compact_ratio: Number(event.target.value) / 100,
+                    })
+                  }
+                  type="number"
+                  min={50}
+                  max={95}
+                  required
+                />
+                <span>%</span>
+              </div>
+            </label>
+            <label className="setting-field">
+              <span>近期输入预算</span>
+              <div className="number-field">
+                <input
+                  value={form.context_recent_user_inputs_max_tokens ?? 2000}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      context_recent_user_inputs_max_tokens: Number(event.target.value),
+                    })
+                  }
+                  type="number"
+                  min={256}
+                  max={8000}
+                  required
+                />
+                <span>tokens</span>
+              </div>
+            </label>
+            <label className="setting-field">
+              <span>摘要预算</span>
+              <div className="number-field">
+                <input
+                  value={form.context_summary_max_tokens ?? 4000}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      context_summary_max_tokens: Number(event.target.value),
+                    })
+                  }
+                  type="number"
+                  min={512}
+                  max={16000}
+                  required
+                />
+                <span>tokens</span>
+              </div>
+            </label>
+            <label className="context-switch-row">
+              <span>
+                <strong>自动上下文压缩</strong>
+              </span>
+              <input
+                checked={form.context_compaction_enabled ?? true}
+                onChange={(event) =>
+                  setForm({
+                    ...form,
+                    context_compaction_enabled: event.target.checked,
+                  })
+                }
+                type="checkbox"
+              />
             </label>
             <label className="settings-switch-row">
               <span>
@@ -3001,6 +3602,10 @@ function formatDuration(value: number) {
   return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
 }
 
+function formatTurnDuration(value: number) {
+  return `${(Math.max(0, value) / 1000).toFixed(1)} s`;
+}
+
 function effectLabel(effect: string) {
   if (effect === "read_only") return "只读";
   if (effect === "workspace_write") return "工作区";
@@ -3042,6 +3647,12 @@ function eventLabel(event: StreamEvent) {
   if (event.type === "context.window_usage") {
     const ratio = Number(event.data.usage_ratio ?? 0);
     return `上下文占用 ${Math.round(ratio * 100)}%`;
+  }
+  if (event.type === "context.compression.started") return "正在准备上下文压缩";
+  if (event.type === "context.compression.progress") {
+    return event.data.phase === "applying"
+      ? "正在重建上下文"
+      : "正在生成交接摘要";
   }
   return event.type;
 }

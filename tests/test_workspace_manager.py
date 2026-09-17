@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from coding_agent.application.service import WorkspaceManager
@@ -12,6 +13,28 @@ from coding_agent.workspace.lock import RepositoryLock
 def init_repository(path: Path) -> None:
     path.mkdir()
     subprocess.run(["git", "-C", str(path), "init"], check=True, capture_output=True)
+
+
+def test_workspace_manager_delegates_turn_context() -> None:
+    manager = WorkspaceManager(
+        workspace_path=None,
+        model=None,
+        base_url=None,
+        config_path=None,
+        session_id=None,
+        langsmith_enabled=False,
+    )
+    manager.active = SimpleNamespace(
+        turn_context=lambda session_id, turn_number: {
+            "session_id": session_id,
+            "turn_number": turn_number,
+        }
+    )
+
+    assert manager.turn_context("session", 3) == {
+        "session_id": "session",
+        "turn_number": 3,
+    }
 
 
 def test_workspace_manager_starts_empty_and_switches_isolated_repositories(

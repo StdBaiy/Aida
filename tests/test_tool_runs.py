@@ -16,6 +16,7 @@ from coding_agent.execution import ToolRunManager, activate_tool_turn
 from coding_agent.execution.host import HostExecutionBackend
 from coding_agent.models import CommandRequest
 from coding_agent.runtime import AgentRuntime
+from coding_agent.tool_outputs import ToolOutputArchiveService
 from coding_agent.tracing import TraceRecorder, TraceStore
 from coding_agent.workspace.paths import PathGuard
 
@@ -144,6 +145,65 @@ def test_tool_run_exposes_incremental_output_and_probe_timeout() -> None:
     ]
     assert events[-1][1]["result_preview"] == '{"ok": true, "value": 42}'
     manager.close()
+
+
+def test_background_tool_spool_preserves_output_evicted_from_memory(
+    tmp_path: Path,
+) -> None:
+    archive = ToolOutputArchiveService(tmp_path / "agent.db", tmp_path / "artifacts")
+    manager = ToolRunManager(
+        max_workers=1,
+        max_output_bytes=6,
+        output_archive=archive,
+        session_id="session",
+        spool_root=tmp_path / "spool",
+    )
+    manager.begin_turn("thread")
+
+    def work(_cancel: threading.Event, output: Any) -> dict[str, object]:
+        output("stdout", b"first\n")
+        output("stderr", b"second\n")
+        return {"ok": True}
+
+    with activate_tool_turn("thread", None):
+        started = manager.start_current(name="streaming", effect="read_only", work=work)
+    run_id = str(started["run_id"])
+    assert manager.drain_thread("thread", timeout_seconds=2)
+
+    final = manager.inspect("thread", run_id)
+    assert final["output_truncated"]
+    stream_ref = final["stream_tool_output_ref"]
+    assert stream_ref
+    archived = archive.read(session_id="session", tool_output_id=stream_ref)
+    records = [json.loads(line) for line in archived["content"].splitlines()]
+    assert [record["stream"] for record in records] == ["stdout", "stderr"]
+    assert [record["data_base64"] for record in records] == [
+        "Zmlyc3QK",
+        "c2Vjb25kCg==",
+    ]
+    manager.close()
+    archive.close()
+
+
+def test_background_tool_recovers_partial_spool_after_restart(tmp_path: Path) -> None:
+    archive = ToolOutputArchiveService(tmp_path / "agent.db", tmp_path / "artifacts")
+    spool_root = tmp_path / "spool"
+    spool_root.mkdir()
+    spool = spool_root / "orphan.ndjson"
+    spool.write_text('{"cursor":1,"stream":"stdout","data_base64":"b3JwaGFu"}\n')
+
+    manager = ToolRunManager(
+        output_archive=archive,
+        session_id="session",
+        spool_root=spool_root,
+    )
+
+    [recovered] = archive.list_outputs("session")
+    assert recovered["invocation_id"] == "background:orphan"
+    assert recovered["complete"] == 0
+    assert not spool.exists()
+    manager.close()
+    archive.close()
 
 
 def test_command_tool_run_can_be_cancelled(tmp_path: Path) -> None:

@@ -41,7 +41,7 @@ class ContextAccountant:
         self.config = config
 
         # Fast-path estimates (updated before model call)
-        self._estimated_total: int = 0
+        self._used_tokens: int = 0
         self._message_count: int = 0
         self._has_exact_usage = False
 
@@ -50,6 +50,8 @@ class ContextAccountant:
         self.cache_hit_tokens: int = 0
         self.cache_miss_tokens: int = 0
         self.completion_tokens: int = 0
+        self.cumulative_prompt_tokens: int = 0
+        self.cumulative_completion_tokens: int = 0
 
         # Compression tracking
         self.compression_count: int = 0
@@ -82,7 +84,7 @@ class ContextAccountant:
         """Update the fast-path estimate and current message count."""
         self._message_count = max(message_count, 0)
         if force or not self._has_exact_usage:
-            self._estimated_total = max(total_tokens, 0)
+            self._used_tokens = max(total_tokens, 0)
             self._has_exact_usage = False
 
     # ── Slow-path correction (called from callback after model returns) ──
@@ -98,19 +100,28 @@ class ContextAccountant:
         self.completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.cache_hit_tokens = int(usage.get("prompt_cache_hit_tokens", 0) or 0)
         self.cache_miss_tokens = int(usage.get("prompt_cache_miss_tokens", 0) or 0)
-        self._estimated_total = self.total_prompt_tokens + self.completion_tokens
+        self.cumulative_prompt_tokens += self.total_prompt_tokens
+        self.cumulative_completion_tokens += self.completion_tokens
+        # Window occupancy is the model-visible input. Completion usage is cost
+        # telemetry and only enters the next occupancy after it becomes history.
+        self._used_tokens = self.total_prompt_tokens
         self._has_exact_usage = self.total_prompt_tokens > 0
 
     # ── Read-only computed properties ──
 
     @property
     def total_tokens(self) -> int:
-        """Current total tokens (estimated or exact, whichever is newer)."""
-        return self._estimated_total
+        """Backward-compatible alias for current input window occupancy."""
+        return self._used_tokens
 
     @total_tokens.setter
     def total_tokens(self, value: int) -> None:
-        self._estimated_total = value
+        self._used_tokens = value
+
+    @property
+    def used_tokens(self) -> int:
+        """Current model-visible input occupancy."""
+        return self._used_tokens
 
     @property
     def has_exact_usage(self) -> bool:
@@ -153,7 +164,7 @@ class ContextAccountant:
 
     def usage_ratio(self) -> float:
         """Current usage as a fraction of hard_limit (0..1)."""
-        return self._estimated_total / max(self.config.hard_limit, 1)
+        return self._used_tokens / max(self.config.hard_limit, 1)
 
     # ── Urgency decision ──
 
@@ -185,7 +196,7 @@ class ContextAccountant:
                 return CompressUrgency.EMERGENCY
             # Raise the bar by 10% of hard_limit
             effective_threshold = self.config.soft_limit + int(self.config.hard_limit * 0.1)
-            if self._estimated_total >= effective_threshold:
+            if self._used_tokens >= effective_threshold:
                 return CompressUrgency.NORMAL
             return CompressUrgency.NONE
         return base
@@ -194,18 +205,59 @@ class ContextAccountant:
         """Record that a compression event occurred."""
         self.compression_count += 1
         self.last_strategy = strategy
-        self._estimated_total = max(0, total_tokens)
+        self._used_tokens = max(0, total_tokens)
+        self._has_exact_usage = False
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore a persisted owner snapshot into a fresh runtime."""
+        self._used_tokens = max(
+            0,
+            int(snapshot.get("used_tokens", snapshot.get("total_tokens", 0)) or 0),
+        )
+        self._message_count = max(0, int(snapshot.get("message_count", 0) or 0))
+        self.total_prompt_tokens = max(
+            0,
+            int(snapshot.get("last_prompt_tokens", 0) or 0),
+        )
+        self.completion_tokens = max(
+            0,
+            int(snapshot.get("last_completion_tokens", 0) or 0),
+        )
+        self.cache_hit_tokens = max(0, int(snapshot.get("cache_hit_tokens", 0) or 0))
+        self.cache_miss_tokens = max(0, int(snapshot.get("cache_miss_tokens", 0) or 0))
+        self.cumulative_prompt_tokens = max(
+            0,
+            int(snapshot.get("cumulative_prompt_tokens", 0) or 0),
+        )
+        self.cumulative_completion_tokens = max(
+            0,
+            int(snapshot.get("cumulative_completion_tokens", 0) or 0),
+        )
+        self.compression_count = max(
+            0,
+            int(snapshot.get("compression_count", 0) or 0),
+        )
+        strategy = snapshot.get("last_strategy")
+        self.last_strategy = str(strategy) if strategy else None
         self._has_exact_usage = False
 
     def snapshot(self) -> dict[str, Any]:
         """Return a portable snapshot for event emission and persistence."""
         return {
-            "total_tokens": self.total_tokens,
+            "used_tokens": self.used_tokens,
+            "max_tokens": self.config.hard_limit,
+            # Compatibility aliases for existing clients during migration.
+            "total_tokens": self.used_tokens,
             "hard_limit": self.config.hard_limit,
             "usage_ratio": round(self.usage_ratio(), 4),
             "urgency": self.should_compress_cached().value,
             "message_count": self._message_count,
             "compression_count": self.compression_count,
+            "last_strategy": self.last_strategy,
+            "last_prompt_tokens": self.total_prompt_tokens,
+            "last_completion_tokens": self.completion_tokens,
+            "cumulative_prompt_tokens": self.cumulative_prompt_tokens,
+            "cumulative_completion_tokens": self.cumulative_completion_tokens,
             "cache_hit_tokens": self.cache_hit_tokens,
             "cache_miss_tokens": self.cache_miss_tokens,
             "cache_hit_rate": round(self.cache_hit_rate, 4),

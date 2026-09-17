@@ -25,7 +25,7 @@ class ContextWindowConfig:
 
     model: str
     hard_limit: int = 1_000_000
-    soft_limit: int = 700_000
+    soft_limit: int = 800_000
     emergency_threshold: int = 900_000
     compression_target_ratio: float = 0.4
     max_output_tokens: int = 32_000
@@ -41,13 +41,13 @@ CONTEXT_WINDOW_PRESETS: dict[str, ContextWindowConfig] = {
     "deepseek-flash": ContextWindowConfig(
         model="deepseek-flash",
         hard_limit=1_000_000,
-        soft_limit=700_000,
+        soft_limit=800_000,
         emergency_threshold=900_000,
     ),
     "deepseek-chat": ContextWindowConfig(
         model="deepseek-chat",
         hard_limit=1_000_000,
-        soft_limit=700_000,
+        soft_limit=800_000,
         emergency_threshold=900_000,
     ),
 }
@@ -71,7 +71,7 @@ def resolve_context_config(model: str) -> ContextWindowConfig:
     return ContextWindowConfig(
         model=model,
         hard_limit=128_000,
-        soft_limit=90_000,
+        soft_limit=102_400,
         emergency_threshold=110_000,
         max_output_tokens=16_000,
         min_reserved_tokens=16_000,

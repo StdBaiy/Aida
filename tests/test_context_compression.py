@@ -1,10 +1,19 @@
+import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.outputs import ChatGeneration, LLMResult
+from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
 
 from coding_agent.context import CompressUrgency, ContextAccountant, ContextCompressor
@@ -23,6 +32,74 @@ def context_config() -> ContextWindowConfig:
         emergency_threshold=150_000,
         min_messages_before_compress=1,
     )
+
+
+def test_graph_config_always_includes_root_checkpoint_namespace() -> None:
+    assert AgentRuntime.graph_config("thread") == {
+        "configurable": {
+            "thread_id": "thread",
+            "checkpoint_ns": "",
+        }
+    }
+    assert AgentRuntime.graph_config("thread", "checkpoint") == {
+        "configurable": {
+            "thread_id": "thread",
+            "checkpoint_ns": "",
+            "checkpoint_id": "checkpoint",
+        }
+    }
+
+
+def test_checkpoint_context_resolves_the_historical_thread_and_serializes_messages() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO checkpoints VALUES ('historical-thread', '', 'checkpoint-1')"
+    )
+
+    class Graph:
+        def get_state(self, config: dict[str, Any]) -> Any:
+            assert config["configurable"] == {
+                "thread_id": "historical-thread",
+                "checkpoint_ns": "",
+                "checkpoint_id": "checkpoint-1",
+            }
+            return SimpleNamespace(
+                values={
+                    "messages": [
+                        HumanMessage(
+                            content="inspect me",
+                            additional_kwargs={"origin": "user"},
+                        )
+                    ]
+                }
+            )
+
+    @tool
+    def read_file(path: str) -> str:
+        """Read a file."""
+        return path
+
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.connection = connection
+    runtime.saver = SimpleNamespace(lock=threading.Lock())
+    runtime.graph = cast(Any, Graph())
+    runtime.context_config = context_config()
+    runtime.accountant = ContextAccountant(runtime.context_config)
+    runtime._system_prompt = "system prompt"
+    runtime._context_tools = [read_file]
+
+    result = runtime.inspect_checkpoint_context("checkpoint-1")
+
+    assert result["thread_id"] == "historical-thread"
+    assert result["message_count"] == 1
+    assert result["messages"][0]["content"] == "inspect me"
+    assert result["messages"][0]["additional_kwargs"]["origin"] == "user"
+    assert result["static_context"]["system_prompt"] == "system prompt"
+    assert result["static_context"]["tools"][0]["name"] == "read_file"
+    connection.close()
 
 
 def test_compressor_is_immutable_and_requires_artifacts_before_compacting() -> None:
@@ -113,10 +190,38 @@ def test_usage_callback_corrects_accounting_and_cache_details() -> None:
     )
 
     assert accountant.has_exact_usage
-    assert accountant.total_tokens == 100
+    assert accountant.used_tokens == 90
+    assert accountant.total_tokens == 90
+    assert accountant.completion_tokens == 10
+    assert accountant.cumulative_prompt_tokens == 90
+    assert accountant.cumulative_completion_tokens == 10
     assert accountant.cache_hit_tokens == 70
     assert accountant.cache_miss_tokens == 20
     assert accountant.estimate_text("中文") == 2
+
+
+def test_accountant_snapshot_round_trips_window_and_cumulative_usage() -> None:
+    accountant = ContextAccountant(context_config())
+    accountant.record_usage(
+        {
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 50,
+            "prompt_cache_miss_tokens": 30,
+        }
+    )
+    accountant.mark_compressed("handoff_summary", 45)
+
+    restored = ContextAccountant(context_config())
+    restored.restore(accountant.snapshot())
+
+    assert restored.used_tokens == 45
+    assert restored.total_prompt_tokens == 80
+    assert restored.completion_tokens == 20
+    assert restored.cumulative_prompt_tokens == 80
+    assert restored.cumulative_completion_tokens == 20
+    assert restored.compression_count == 1
+    assert restored.last_strategy == "handoff_summary"
 
 
 def test_blended_cache_price_keeps_per_million_units() -> None:
@@ -124,6 +229,153 @@ def test_blended_cache_price_keeps_per_million_units() -> None:
     tracker.record_usage(100, 50, 50, 0)
 
     assert tracker.blended_cost_per_1m == 0.07150000000000001
+
+
+def test_recent_user_inputs_keep_chronological_order_and_skip_internal_messages() -> None:
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.context_config = context_config()
+    runtime.accountant = ContextAccountant(runtime.context_config)
+    runtime._context_tools = []
+    runtime._system_prompt = "system"
+    messages = [
+        HumanMessage(content="first", additional_kwargs={"origin": "user"}),
+        HumanMessage(content="scheduler", additional_kwargs={"origin": "tool_scheduler"}),
+        AIMessage(content="answer"),
+        HumanMessage(content="second", additional_kwargs={"origin": "user"}),
+    ]
+
+    selected = runtime._recent_user_inputs(messages, token_budget=100)
+
+    assert [message.content for message in selected] == ["first", "second"]
+
+
+def test_recent_user_inputs_truncate_only_the_oldest_selected_message() -> None:
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.context_config = context_config()
+    runtime.accountant = ContextAccountant(runtime.context_config)
+    runtime._context_tools = []
+    runtime._system_prompt = "system"
+    newest = HumanMessage(content="newest", additional_kwargs={"origin": "user"})
+    messages = [
+        HumanMessage(content="a" * 200, additional_kwargs={"origin": "user"}),
+        newest,
+    ]
+
+    selected = runtime._recent_user_inputs(messages, token_budget=15)
+
+    assert selected[-1].content == "newest"
+    assert sum(
+        runtime._estimate_context([message], include_static=False)
+        for message in selected
+    ) <= 15
+
+
+def test_compaction_rebuilds_summary_manifest_and_recent_input_order() -> None:
+    messages = [
+        HumanMessage(content="old request", additional_kwargs={"origin": "user"}),
+        AIMessage(content="old answer"),
+        HumanMessage(content="latest request", additional_kwargs={"origin": "user"}),
+    ]
+
+    class Graph:
+        def __init__(self) -> None:
+            self.update: list[Any] = []
+
+        def get_state(self, _config: Any) -> Any:
+            return SimpleNamespace(values={"messages": messages})
+
+        def update_state(self, _config: Any, values: dict[str, Any]) -> dict[str, Any]:
+            self.update = values["messages"]
+            return {"configurable": {"checkpoint_id": "compressed-checkpoint"}}
+
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.graph = cast(Any, Graph())
+    runtime._model = SimpleNamespace(
+        invoke=lambda *_args, **_kwargs: AIMessage(content="new summary")
+    )
+    runtime._system_prompt = "system"
+    runtime.context_config = context_config()
+    runtime.accountant = ContextAccountant(runtime.context_config)
+    runtime._context_tools = []
+    runtime.context_summary_max_tokens = 100
+    runtime.context_recent_user_inputs_max_tokens = 100
+    runtime._session_id = "session"
+    runtime.tool_output_archive = SimpleNamespace(
+        list_outputs=lambda _session_id: [
+            {
+                "tool_output_id": "tool-output",
+                "invocation_id": "call",
+                "byte_size": 12,
+            }
+        ]
+    )
+
+    result = runtime.compact_context(
+        thread_id="thread",
+        checkpoint_id="checkpoint",
+        summaries=[{"summary_id": "summary_000", "content": "old summary"}],
+    )
+
+    update = runtime.graph.update
+    assert isinstance(update[0], RemoveMessage)
+    assert isinstance(update[1], SystemMessage)
+    assert update[1].additional_kwargs["summary_id"] == "summary_000"
+    assert isinstance(update[2], SystemMessage)
+    assert update[2].additional_kwargs["summary_id"] == "summary_001"
+    assert isinstance(update[3], SystemMessage)
+    assert update[3].additional_kwargs["origin"] == "tool_evidence_manifest"
+    assert [message.content for message in update[4:]] == [
+        "old request",
+        "latest request",
+    ]
+    assert result["summary_id"] == "summary_001"
+    assert result["checkpoint_id"] == "compressed-checkpoint"
+
+
+def test_budget_guard_commits_pending_input_without_sampling() -> None:
+    class Graph:
+        def __init__(self) -> None:
+            self.messages: list[Any] = [HumanMessage(content="x" * 400)]
+
+        def get_state(self, _config: Any) -> Any:
+            return SimpleNamespace(values={"messages": self.messages})
+
+        def update_state(self, _config: Any, values: dict[str, Any]) -> None:
+            self.messages.extend(values["messages"])
+
+    runtime = AgentRuntime.__new__(AgentRuntime)
+    runtime.graph = cast(Any, Graph())
+    runtime.context_config = ContextWindowConfig(
+        model="test",
+        hard_limit=100,
+        soft_limit=80,
+        emergency_threshold=90,
+        max_output_tokens=20,
+        min_reserved_tokens=20,
+    )
+    runtime.accountant = ContextAccountant(runtime.context_config)
+    runtime._context_tools = []
+    runtime._system_prompt = "system"
+
+    result = runtime._guard_context_budget(
+        {"configurable": {"thread_id": "thread"}},
+        {
+            "messages": [
+                HumanMessage(
+                    content="continue",
+                    additional_kwargs={"origin": "user"},
+                )
+            ]
+        },
+    )
+
+    assert result is not None
+    assert isinstance(runtime.graph.messages[-2], HumanMessage)
+    assert isinstance(runtime.graph.messages[-1], AIMessage)
+    assert (
+        runtime.graph.messages[-1].additional_kwargs["error_code"]
+        == "CONTEXT_BUDGET_EXHAUSTED"
+    )
 
 
 def test_runtime_compression_preserves_tool_metadata_and_records_audit(

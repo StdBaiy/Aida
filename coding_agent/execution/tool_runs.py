@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import threading
 import time
 from collections.abc import Callable, Generator
@@ -10,6 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.tools import BaseTool, StructuredTool, tool
@@ -17,6 +20,7 @@ from langchain_core.tools import BaseTool, StructuredTool, tool
 from coding_agent.errors import fail
 from coding_agent.models import utc_now
 from coding_agent.repository import new_id
+from coding_agent.tool_outputs import ToolOutputArchiveService
 from coding_agent.tracing.recorder import TraceRecorder
 from coding_agent.tracing.redaction import redact
 
@@ -102,6 +106,9 @@ class _ToolRun:
     emitted_output_truncated: bool = False
     next_cursor: int = 1
     settled: bool = False
+    spool_path: Path | None = None
+    stream_tool_output_id: str | None = None
+    result_tool_output_id: str | None = None
 
 
 @dataclass
@@ -118,9 +125,35 @@ class _ExecutionGroup:
 class ToolRunManager:
     """Execute long-running tools concurrently within one graph turn."""
 
-    def __init__(self, *, max_workers: int = 4, max_output_bytes: int = 65_536) -> None:
+    def __init__(
+        self,
+        *,
+        max_workers: int = 4,
+        max_output_bytes: int = 65_536,
+        output_archive: ToolOutputArchiveService | None = None,
+        session_id: str = "local",
+        spool_root: Path | None = None,
+    ) -> None:
         self.max_workers = max_workers
         self.max_output_bytes = max_output_bytes
+        self.output_archive = output_archive
+        self.session_id = session_id
+        self.spool_root = spool_root
+        if spool_root is not None:
+            spool_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if output_archive is not None:
+                for spool in spool_root.glob("*.ndjson"):
+                    archived = output_archive.archive_bytes(
+                        session_id=session_id,
+                        invocation_id=f"background:{spool.stem}",
+                        payload=spool.read_bytes(),
+                        media_type="application/x-ndjson",
+                        sequence=0,
+                        part_name="stream",
+                        complete=False,
+                    )
+                    if archived:
+                        spool.unlink(missing_ok=True)
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="coding-agent-tool",
@@ -299,7 +332,14 @@ class ToolRunManager:
                 span_id=span_id,
                 created_at=utc_now().isoformat(),
                 started_monotonic=time.monotonic(),
+                spool_path=(
+                    self.spool_root / f"{run_id}.ndjson"
+                    if self.spool_root is not None
+                    else None
+                ),
             )
+            if run.spool_path is not None:
+                run.spool_path.touch(mode=0o600, exist_ok=False)
             self._runs[run_id] = run
             self._emit(
                 run,
@@ -360,12 +400,18 @@ class ToolRunManager:
                     else round(now - run.started_monotonic, 3)
                 ),
                 "next_cursor": run.next_cursor - 1,
-                "output_truncated": bool(
-                    run.chunks and after_cursor < run.chunks[0].cursor - 1
+                "output_truncated": (
+                    run.next_cursor > 1
+                    and (
+                        not run.chunks
+                        or after_cursor < run.chunks[0].cursor - 1
+                    )
                 ),
                 "output": chunks,
                 "result": run.result if run.status in _TERMINAL_STATUSES else None,
                 "error": run.error,
+                "stream_tool_output_ref": run.stream_tool_output_id,
+                "result_tool_output_ref": run.result_tool_output_id,
             }
 
     def wait_current(self, run_ids: list[str], *, timeout_seconds: int) -> dict[str, Any]:
@@ -706,6 +752,12 @@ class ToolRunManager:
                 )
         finally:
             _ACTIVE_TOOL_RUN_ID.reset(token)
+            try:
+                self._archive_run(run)
+            except BaseException as exc:
+                with self._condition:
+                    run.status = "failed"
+                    run.error = f"TOOL_OUTPUT_PERSIST_FAILED: {exc}"
             with self._condition:
                 group = self._group_for(run)
                 if group is not None:
@@ -722,6 +774,19 @@ class ToolRunManager:
         text = chunk.decode(errors="replace")
         with self._condition:
             run = self._runs[run_id]
+            if run.spool_path is not None:
+                record = json.dumps(
+                    {
+                        "cursor": run.next_cursor,
+                        "stream": stream,
+                        "data_base64": base64.b64encode(chunk).decode("ascii"),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8") + b"\n"
+                with run.spool_path.open("ab") as spool:
+                    spool.write(record)
+                    spool.flush()
+                    os.fsync(spool.fileno())
             output = _OutputChunk(run.next_cursor, stream, text, len(chunk))
             run.next_cursor += 1
             run.chunks.append(output)
@@ -757,6 +822,37 @@ class ToolRunManager:
                     "text": safe_text,
                 },
             )
+
+    def _archive_run(self, run: _ToolRun) -> None:
+        if self.output_archive is None:
+            return
+        invocation_id = f"background:{run.run_id}"
+        if run.spool_path is not None:
+            payload = run.spool_path.read_bytes()
+            archived = self.output_archive.archive_bytes(
+                session_id=self.session_id,
+                invocation_id=invocation_id,
+                payload=payload,
+                media_type="application/x-ndjson",
+                sequence=0,
+                part_name="stream",
+                complete=True,
+            )
+            run.stream_tool_output_id = str(archived["tool_output_id"])
+            run.spool_path.unlink(missing_ok=True)
+        archived_result = self.output_archive.archive(
+            session_id=self.session_id,
+            invocation_id=invocation_id,
+            output={
+                "status": run.status,
+                "result": run.result,
+                "error": run.error,
+            },
+            sequence=1,
+            part_name="result",
+            complete=True,
+        )
+        run.result_tool_output_id = str(archived_result["tool_output_id"])
 
     def _trace_attributes(self, run: _ToolRun) -> dict[str, Any]:
         return {
@@ -842,6 +938,8 @@ class ToolRunManager:
             "error": run.error,
             "result_preview": safe_preview,
             "output_truncated": run.emitted_output_truncated,
+            "stream_tool_output_ref": run.stream_tool_output_id,
+            "result_tool_output_ref": run.result_tool_output_id,
         }
 
     @staticmethod

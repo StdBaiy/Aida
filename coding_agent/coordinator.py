@@ -8,6 +8,7 @@ from contextlib import suppress
 from typing import Any
 
 from coding_agent.errors import CodingAgentError, fail
+from coding_agent.models import utc_now
 from coding_agent.repository import SqliteCheckpointRepository, new_id
 from coding_agent.runtime import AgentRuntime, ApprovalCallback, TokenCallback, ToolEventCallback
 from coding_agent.tracing.exporter import MetricsLangSmithExporter
@@ -50,13 +51,37 @@ class TurnCoordinator:
         self.model_id = model_id
         self.trace_secrets = trace_secrets
         self.mutation_gate = mutation_gate
+        self._baseline_lock = threading.Lock()
 
     def ensure_baseline(self) -> None:
         """Create turn zero for a new session."""
+        with self._baseline_lock:
+            self._ensure_baseline_locked()
+
+    def _ensure_baseline_locked(self) -> None:
+        """Create turn zero after serializing concurrent bootstrap callers."""
         timeline = self.repository.active_timeline(self.session_id)
-        if self.repository.turns(timeline.timeline_id):
+        turns = self.repository.turns(timeline.timeline_id)
+        if turns:
+            owner_id = self._context_owner_id(timeline.timeline_id)
+            if self.repository.context_state(owner_id) is None:
+                checkpoint_id = timeline.head_checkpoint_id or turns[-1].checkpoint_id
+                self.repository.save_context_state(
+                    context_owner_id=owner_id,
+                    session_id=self.session_id,
+                    timeline_id=timeline.timeline_id,
+                    attempt_id=None,
+                    snapshot=self.runtime.measure_context(
+                        thread_id=timeline.thread_id,
+                        checkpoint_id=checkpoint_id,
+                    ),
+                )
             return
         checkpoint_id = self.runtime.initialize_thread(timeline.thread_id)
+        context_snapshot = self.runtime.measure_context(
+            thread_id=timeline.thread_id,
+            checkpoint_id=checkpoint_id,
+        )
         snapshot_oid = self.snapshots.create(
             ref=self._timeline_ref(timeline.timeline_id),
             parent_oid=None,
@@ -65,10 +90,13 @@ class TurnCoordinator:
         self.repository.add_turn(
             timeline_id=timeline.timeline_id,
             checkpoint_id=checkpoint_id,
+            thread_id=timeline.thread_id,
             snapshot_oid=snapshot_oid,
             user_text="",
             assistant_text="",
             turn_number=0,
+            context_owner_id=self._context_owner_id(timeline.timeline_id),
+            context_snapshot=context_snapshot,
         )
 
     def run_turn(
@@ -83,13 +111,19 @@ class TurnCoordinator:
         message_origin: str = "user",
     ) -> str:
         """Run and jointly commit one user turn."""
+        started_at = utc_now()
         timeline = self.repository.active_timeline(self.session_id)
         turns = self.repository.turns(timeline.timeline_id)
         parent_oid = turns[-1].snapshot_oid
+        persisted_context = self.repository.context_state(
+            self._context_owner_id(timeline.timeline_id)
+        )
+        if persisted_context is not None:
+            self.runtime.accountant.restore(persisted_context.model_dump(mode="json"))
         execution_thread_id = new_id()
         self.runtime.fork_checkpoint(
             source_thread_id=timeline.thread_id,
-            source_checkpoint_id=turns[-1].checkpoint_id,
+            source_checkpoint_id=timeline.head_checkpoint_id or turns[-1].checkpoint_id,
             target_thread_id=execution_thread_id,
         )
         turn_id, trace_id, logical_run_id = new_id(), new_id(), new_id()
@@ -143,6 +177,10 @@ class TurnCoordinator:
                 )
                 snapshot_created = True
             self._raise_if_cancelled(cancelled)
+            context_snapshot = self.runtime.measure_context(
+                thread_id=execution_thread_id,
+                checkpoint_id=checkpoint_id,
+            )
             self.repository.add_turn(
                 timeline_id=timeline.timeline_id,
                 checkpoint_id=checkpoint_id,
@@ -151,6 +189,9 @@ class TurnCoordinator:
                 user_text=user_text,
                 assistant_text=assistant_text,
                 turn_id=turn_id,
+                started_at=started_at,
+                context_owner_id=self._context_owner_id(timeline.timeline_id),
+                context_snapshot=context_snapshot,
             )
         except BaseException as exc:
             owns_workspace = (
@@ -214,6 +255,56 @@ class TurnCoordinator:
             for turn in self.repository.history_turns(timeline.timeline_id)
         ]
 
+    def context_snapshot(self) -> dict[str, Any]:
+        timeline = self.repository.active_timeline(self.session_id)
+        state = self.repository.context_state(self._context_owner_id(timeline.timeline_id))
+        if state is None:
+            self.ensure_baseline()
+            state = self.repository.context_state(
+                self._context_owner_id(timeline.timeline_id)
+            )
+        if state is None:
+            raise fail("CONTEXT_STATE_MISSING", "Context state could not be initialized.")
+        return state.model_dump(mode="json")
+
+    def compact_context(self, *, trigger: str, force: bool = False) -> dict[str, Any] | None:
+        """Compact only the current committed timeline head."""
+        timeline = self.repository.active_timeline(self.session_id)
+        state = self.context_snapshot()
+        if not force and (
+            not self.runtime.context_compaction_enabled
+            or float(state.get("usage_ratio", 0.0))
+            < self.runtime.context_config.soft_limit
+            / max(self.runtime.context_config.hard_limit, 1)
+        ):
+            return None
+        turns = self.repository.turns(timeline.timeline_id)
+        if not turns:
+            raise fail("CONTEXT_STATE_MISSING", "The active timeline has no checkpoint.")
+        base_checkpoint_id = timeline.head_checkpoint_id or turns[-1].checkpoint_id
+        before_tokens = int(state.get("used_tokens", 0) or 0)
+        result = self.runtime.compact_context(
+            thread_id=timeline.thread_id,
+            checkpoint_id=base_checkpoint_id,
+            summaries=list(state.get("summaries", [])),
+        )
+        usage = {
+            **result["usage"],
+            "summaries": result["summaries"],
+        }
+        return self.repository.commit_context_compaction(
+            context_owner_id=self._context_owner_id(timeline.timeline_id),
+            session_id=self.session_id,
+            timeline_id=timeline.timeline_id,
+            thread_id=timeline.thread_id,
+            base_checkpoint_id=base_checkpoint_id,
+            result_checkpoint_id=str(result["checkpoint_id"]),
+            trigger=trigger,
+            summary_id=str(result["summary_id"]),
+            before_tokens=before_tokens,
+            snapshot=usage,
+        )
+
     def restore(self, turn_number: int) -> None:
         """Fork graph state and workspace state from a committed turn."""
         source = self.repository.active_timeline(self.session_id)
@@ -241,6 +332,16 @@ class TurnCoordinator:
                 checkpoint_id=target_checkpoint_id,
                 timeline_id=target_timeline_id,
             )
+            self.repository.save_context_state(
+                context_owner_id=self._context_owner_id(target_timeline_id),
+                session_id=self.session_id,
+                timeline_id=target_timeline_id,
+                attempt_id=None,
+                snapshot=self.runtime.measure_context(
+                    thread_id=target_thread_id,
+                    checkpoint_id=target_checkpoint_id,
+                ),
+            )
         except Exception:
             self.snapshots.restore(current_oid)
             raise
@@ -253,6 +354,18 @@ class TurnCoordinator:
         if summary is None:
             raise ValueError(f"No trace exists for turn {turn_number}.")
         return summary
+
+    def turn_context(self, turn_number: int) -> dict[str, Any]:
+        """Return the model-visible checkpoint context committed by one turn."""
+        timeline = self.repository.active_timeline(self.session_id)
+        turn = self.repository.get_turn(timeline.timeline_id, turn_number)
+        return {
+            "turn": turn.model_dump(mode="json"),
+            "context": self.runtime.inspect_checkpoint_context(turn.checkpoint_id),
+        }
+
+    def _context_owner_id(self, timeline_id: str) -> str:
+        return f"main:{self.session_id}:{timeline_id}"
 
     def _export_trace(self, recorder: TraceRecorder) -> None:
         span_id = recorder.start_span("langsmith.export", kind="export")

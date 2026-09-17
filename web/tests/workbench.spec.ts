@@ -65,6 +65,151 @@ test("desktop renders the complete three-column workbench", async ({ page }) => 
   await page.screenshot({ path: "test-results/desktop-workbench.png", fullPage: true });
 });
 
+test("orders compression notices in the timeline and shows turn duration", async ({
+  page,
+}) => {
+  await mockWorkbench(page, {
+    "/api/v1/sessions/active/turns": {
+      timeline_id: "timeline",
+      turns: [
+        {
+          turn_id: "turn-1",
+          turn_number: 1,
+          user_text: "first request",
+          assistant_text: "first response",
+          created_at: "2026-09-18T10:00:00Z",
+          duration_ms: 12_345,
+          snapshot_oid: "snapshot-1",
+        },
+        {
+          turn_id: "turn-2",
+          turn_number: 2,
+          user_text: "second request",
+          assistant_text: "second response",
+          created_at: "2026-09-18T10:02:00Z",
+          duration_ms: 987,
+          snapshot_oid: "snapshot-2",
+        },
+      ],
+      notices: [
+        {
+          notice_id: "notice-1",
+          notice_kind: "context.compression.completed",
+          text: "上下文压缩完成：130,926 -> 8,495 tokens",
+          created_at: "2026-09-18T10:01:00Z",
+        },
+      ],
+      next_before_turn_number: null,
+    },
+  });
+
+  await page.goto("/");
+  const timeline = page.locator(".messages > .turn-group, .messages > .system-notice");
+  await expect(timeline).toHaveCount(3);
+  await expect(timeline.nth(0)).toContainText("first request");
+  await expect(timeline.nth(1)).toContainText("上下文压缩完成");
+  await expect(timeline.nth(2)).toContainText("second request");
+  await expect(timeline.nth(0).locator(".turn-duration")).toHaveText("12.3 s");
+  await expect(timeline.nth(2).locator(".turn-duration")).toHaveText("1.0 s");
+});
+
+test("shows context percentage and executes slash commands in the inspector", async ({
+  page,
+}) => {
+  let turnPosts = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === "/api/v1/sessions/active/turns"
+    ) {
+      turnPosts += 1;
+    }
+  });
+  await mockWorkbench(page, {
+    "/api/v1/sessions/active/turns": {
+      timeline_id: "timeline",
+      turns: [
+        {
+          turn_id: "turn-3",
+          turn_number: 3,
+          user_text: "inspect context",
+          assistant_text: "done",
+          created_at: "2026-09-18T10:00:00Z",
+          snapshot_oid: "snapshot-3",
+        },
+      ],
+      notices: [],
+      next_before_turn_number: null,
+    },
+    "/api/v1/sessions/active/context": {
+      context_owner_id: "main:active",
+      session_id: "active",
+      timeline_id: "timeline",
+      used_tokens: 42000,
+      max_tokens: 100000,
+      usage_ratio: 0.42,
+      message_count: 8,
+      compression_count: 0,
+      updated_at: "2026-09-18T10:00:00Z",
+    },
+    "/api/v1/sessions/active/turns/3/context": {
+      turn: { turn_number: 3, checkpoint_id: "checkpoint-3" },
+      context: {
+        checkpoint_id: "checkpoint-3",
+        estimated_tokens: 321,
+        message_count: 1,
+        static_context: {
+          system_prompt: "system prompt",
+          tools: [],
+        },
+        messages: [
+          {
+            index: 0,
+            type: "human",
+            content: "inspect context",
+            estimated_tokens: 4,
+          },
+        ],
+      },
+    },
+  });
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await expect(page.locator(".context-ring-percent").first()).toHaveText("42%");
+
+  const composer = page.getByPlaceholder("描述你希望 Agent 完成的任务");
+  await composer.fill("/");
+  const menu = page.getByRole("listbox", { name: "快捷指令" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("option")).toHaveCount(8);
+
+  await composer.press("ArrowDown");
+  await composer.press("Tab");
+  await expect(composer).toHaveValue("/status");
+  await composer.press("Enter");
+
+  await expect(page.getByRole("button", { name: /指令/ })).toHaveClass(/active/);
+  const result = page.locator(".shortcut-result").first();
+  await expect(result).toContainText("/status");
+  await expect(
+    result.locator(".json-key").filter({ hasText: /^workspace$/ }),
+  ).toBeVisible();
+  await expect(result.locator(".json-value.string", { hasText: "/tmp/test" })).toBeVisible();
+  expect(turnPosts).toBe(0);
+
+  await composer.fill("/turn 3");
+  await composer.press("Enter");
+  const contextResult = page.locator(".shortcut-result").first();
+  await expect(contextResult).toContainText("/turn 3");
+  await expect(contextResult).toContainText("Object(2)");
+  await contextResult.getByText("context", { exact: true }).click();
+  await contextResult.getByText("messages", { exact: true }).click();
+  await contextResult.locator(".json-key").filter({ hasText: /^0$/ }).click();
+  await expect(contextResult).toContainText('"inspect context"');
+  await page.screenshot({ path: "test-results/slash-command-result.png", fullPage: true });
+});
+
 test("mobile switches between conversation and workspace without overflow", async ({ page }) => {
   await mockWorkbench(page);
   await page.setViewportSize({ width: 390, height: 844 });

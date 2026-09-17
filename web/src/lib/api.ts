@@ -32,6 +32,7 @@ export type SubagentAttempt = {
   workspace_state?: "unallocated" | "ready";
   thread_id?: string | null;
   checkpoint_id?: string | null;
+  context_usage?: ContextUsage | null;
   allowed_tools: string[];
   started_at: string | null;
   ended_at: string | null;
@@ -146,6 +147,11 @@ export type SettingsConfig = {
   subagent_model_call_limit: number;
   command_timeout_seconds: number;
   max_parallel_sessions: number;
+  context_auto_compact_ratio: number;
+  context_recent_user_inputs_max_tokens: number;
+  context_summary_max_tokens: number;
+  context_compaction_enabled: boolean;
+  context_window_tokens: number | null;
   sandbox_enabled: boolean;
   sandbox_provider: string;
   sandbox_image: string | null;
@@ -171,13 +177,34 @@ export type Turn = {
   assistant_text: string;
   status?: "completed" | "cancelled";
   created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
   snapshot_oid: string;
 };
 
 export type TurnPage = {
   timeline_id: string;
   turns: Turn[];
+  notices: Array<{
+    notice_id: string;
+    notice_kind: "context.compression.completed";
+    text: string;
+    created_at: string;
+  }>;
   next_before_turn_number: number | null;
+};
+
+export type ContextUsage = {
+  context_owner_id: string;
+  session_id: string;
+  timeline_id: string | null;
+  used_tokens: number;
+  max_tokens: number;
+  usage_ratio: number;
+  message_count: number;
+  compression_count: number;
+  updated_at: string;
 };
 
 export type ToolRunView = {
@@ -354,6 +381,10 @@ export function subscribe(
     "orchestration.failed",
     "orchestration.cancelled",
     "context.window_usage",
+    "context.compression.started",
+    "context.compression.progress",
+    "context.compression.completed",
+    "context.compression.failed",
     "workspace.changed",
     "turn.committed",
     "operation.completed",

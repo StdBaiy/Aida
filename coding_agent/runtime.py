@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,7 +31,7 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -62,6 +63,7 @@ from coding_agent.skills import (
     discover_skills,
     format_skill_catalog,
 )
+from coding_agent.tool_outputs import ToolOutputArchiveMiddleware, ToolOutputArchiveService
 from coding_agent.tools import build_tools
 from coding_agent.tracing.callbacks import LocalTraceCallbackHandler
 from coding_agent.tracing.context import activate_recorder
@@ -97,6 +99,7 @@ class AgentRuntime:
         mutation_gate: WorkspaceMutationGate | None = None,
         role_instruction: str | None = None,
         model_call_limit: int | None = None,
+        session_id: str = "local",
     ) -> None:
         model_name = config.model.removeprefix("openai:")
         model = ChatOpenAI(
@@ -107,6 +110,7 @@ class AgentRuntime:
             timeout=config.model_timeout_seconds,
             use_responses_api=False,
         )
+        self._model = model
         skills = bind_trusted_skill_commands(
             discover_skills(default_skill_roots(workspace_root)),
             config.trusted_skill_commands,
@@ -115,10 +119,53 @@ class AgentRuntime:
             skills,
             max_read_bytes=config.max_read_bytes,
         )
+        self.tool_output_archive = ToolOutputArchiveService(
+            checkpoint_path.parent / "agent.db",
+            checkpoint_path.parent / "tool-output-artifacts",
+        )
         self.tool_runs = ToolRunManager(
             max_workers=config.max_parallel_tools,
             max_output_bytes=config.max_command_output_bytes,
+            output_archive=self.tool_output_archive,
+            session_id=session_id,
+            spool_root=checkpoint_path.parent / "tool-output-spool",
         )
+        self._tool_output_middleware = ToolOutputArchiveMiddleware(
+            self.tool_output_archive,
+            session_id,
+            preview_chars=config.tool_output_preview_tokens * 4,
+        )
+        self._session_id = session_id
+        self._tool_output_read_max_bytes = config.tool_output_read_max_bytes
+
+        @tool
+        def list_tool_outputs() -> list[dict[str, Any]]:
+            """List durable tool outputs owned by this Session."""
+            return self.tool_output_archive.list_outputs(session_id)
+
+        @tool
+        def read_tool_output(
+            tool_output_id: str,
+            offset: int = 0,
+            limit: int = 32_768,
+        ) -> dict[str, Any]:
+            """Read a bounded page from one durable tool output."""
+            return self.tool_output_archive.read(
+                session_id=session_id,
+                tool_output_id=tool_output_id,
+                offset=offset,
+                limit=min(limit, self._tool_output_read_max_bytes),
+            )
+
+        @tool
+        def search_tool_output(query: str, limit: int = 20) -> list[dict[str, Any]]:
+            """Search durable outputs owned by this Session."""
+            return self.tool_output_archive.search(
+                session_id=session_id,
+                query=query,
+                limit=limit,
+            )
+
         self.tool_probe_interval_seconds = config.tool_probe_interval_seconds
         self.max_tool_scheduler_wakes = config.max_tool_scheduler_wakes
         self.model_call_limit = (
@@ -183,6 +230,9 @@ class AgentRuntime:
             self.skill_registry.resource_tool,
             *self.skill_execution.tools,
             *self.tool_runs.tools,
+            list_tool_outputs,
+            read_tool_output,
+            search_tool_output,
         ]
         self.mcp_provider = LazyMCPToolProvider(
             config.mcp_servers,
@@ -191,7 +241,16 @@ class AgentRuntime:
         )
         tools = [*local_tools, *self.mcp_provider.tools, *(extra_tools or [])]
         if allowed_tool_names is not None:
-            tools = [tool for tool in tools if tool.name in allowed_tool_names]
+            evidence_tools = {
+                "list_tool_outputs",
+                "read_tool_output",
+                "search_tool_output",
+            }
+            tools = [
+                tool
+                for tool in tools
+                if tool.name in allowed_tool_names or tool.name in evidence_tools
+            ]
         try:
             self.prompt_bundle = assemble_prompt(
                 skill_catalog=skill_catalog, role_instruction=role_instruction, tools=tools,
@@ -200,9 +259,25 @@ class AgentRuntime:
             self.mcp_provider.close()
             self.tool_runs.close()
             self.execution_service.close()
+            self.tool_output_archive.close()
             raise
         system_prompt = self.prompt_bundle.text
-        self.context_config = resolve_context_config(model_name)
+        resolved_context = resolve_context_config(model_name)
+        hard_limit = config.context_window_tokens or resolved_context.hard_limit
+        self.context_config = replace(
+            resolved_context,
+            hard_limit=hard_limit,
+            soft_limit=int(hard_limit * config.context_auto_compact_ratio),
+            emergency_threshold=min(
+                resolved_context.emergency_threshold,
+                int(hard_limit * 0.9),
+            ),
+        )
+        self.context_recent_user_inputs_max_tokens = (
+            config.context_recent_user_inputs_max_tokens
+        )
+        self.context_summary_max_tokens = config.context_summary_max_tokens
+        self.context_compaction_enabled = config.context_compaction_enabled
         self.accountant = ContextAccountant(self.context_config)
         self._context_tools = tools
         self._system_prompt = system_prompt
@@ -214,11 +289,13 @@ class AgentRuntime:
             self.mcp_provider.close()
             self.tool_runs.close()
             self.execution_service.close()
+            self.tool_output_archive.close()
             raise
         middleware = cast(
             "list[AgentMiddleware[Any, None, Any]]",
             [
                 ModelRetryMiddleware(max_retries=2),
+                self._tool_output_middleware,
                 ModelCallLimitMiddleware(
                     run_limit=self.model_call_limit,
                     exit_behavior="end",
@@ -250,7 +327,11 @@ class AgentRuntime:
     @staticmethod
     def graph_config(thread_id: str, checkpoint_id: str | None = None) -> RunnableConfig:
         """Build a LangGraph checkpoint selector."""
-        configurable = {"thread_id": thread_id}
+        configurable = {
+            "thread_id": thread_id,
+            # SqliteSaver.put_writes indexes this key directly, including for the root graph.
+            "checkpoint_ns": "",
+        }
         if checkpoint_id:
             configurable["checkpoint_id"] = checkpoint_id
         return {"configurable": configurable}
@@ -440,6 +521,234 @@ class AgentRuntime:
         messages = result.get("messages", [])
         estimate = self._estimate_context(messages)
         self.accountant.update_estimate(estimate, len(messages))
+
+    def measure_context(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Measure the complete committed state as the next request would see it."""
+        snapshot = self.graph.get_state(self.graph_config(thread_id, checkpoint_id))
+        messages = list(getattr(snapshot, "values", {}).get("messages", []))
+        self.accountant.update_estimate(
+            self._estimate_context(messages),
+            len(messages),
+            force=True,
+        )
+        return self.accountant.snapshot()
+
+    def inspect_checkpoint_context(self, checkpoint_id: str) -> dict[str, Any]:
+        """Return the complete model-visible context for one committed checkpoint."""
+        with self.saver.lock:
+            rows = self.connection.execute(
+                """
+                SELECT thread_id, checkpoint_ns
+                FROM checkpoints
+                WHERE checkpoint_id = ?
+                LIMIT 2
+                """,
+                (checkpoint_id,),
+            ).fetchall()
+        if not rows:
+            raise fail("CHECKPOINT_NOT_FOUND", "The turn checkpoint no longer exists.")
+        if len(rows) > 1:
+            raise fail(
+                "CHECKPOINT_AMBIGUOUS",
+                "The turn checkpoint resolves to multiple graph threads.",
+            )
+        thread_id, checkpoint_ns = rows[0]
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": str(thread_id),
+                "checkpoint_ns": str(checkpoint_ns),
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        snapshot = self.graph.get_state(config)
+        messages = list(getattr(snapshot, "values", {}).get("messages", []))
+        serialized_messages = []
+        for index, message in enumerate(messages):
+            converted = (
+                message
+                if isinstance(message, BaseMessage)
+                else convert_to_messages([message])[0]
+            )
+            serialized_messages.append(
+                {
+                    "index": index,
+                    "estimated_tokens": self._estimate_context(
+                        [converted],
+                        include_static=False,
+                    ),
+                    **converted.model_dump(mode="json"),
+                }
+            )
+        static_tokens = self._estimate_context([], include_static=True)
+        estimated_tokens = self._estimate_context(messages)
+        return {
+            "checkpoint_id": checkpoint_id,
+            "thread_id": str(thread_id),
+            "checkpoint_ns": str(checkpoint_ns),
+            "estimated_tokens": estimated_tokens,
+            "max_tokens": self.context_config.hard_limit,
+            "usage_ratio": estimated_tokens / max(self.context_config.hard_limit, 1),
+            "message_count": len(messages),
+            "static_context": {
+                "estimated_tokens": static_tokens,
+                "system_prompt": self._system_prompt,
+                "tools": [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "input_schema": item.args,
+                    }
+                    for item in self._context_tools
+                ],
+            },
+            "messages": serialized_messages,
+        }
+
+    def compact_context(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_id: str,
+        summaries: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Generate a handoff summary and atomically replace graph messages."""
+        config = self.graph_config(thread_id, checkpoint_id)
+        state = self.graph.get_state(config)
+        messages = list(getattr(state, "values", {}).get("messages", []))
+        summary_id = f"summary_{len(summaries):03d}"
+        prompt = HumanMessage(
+            content=(
+                "Create a precise handoff summary of the conversation above. "
+                "Preserve the user's current goal, corrections, constraints, decisions, "
+                "completed work, active work, exact file or symbol references, verified "
+                "errors, and next steps. Do not call tools. Do not invent facts. "
+                f"Return only the summary body for {summary_id}."
+            ),
+            additional_kwargs={"origin": "context_compaction"},
+        )
+        response = self._model.invoke(
+            [SystemMessage(content=self._system_prompt), *messages, prompt],
+            max_tokens=self.context_summary_max_tokens,
+        )
+        if not isinstance(response, AIMessage) or response.tool_calls:
+            raise fail(
+                "CONTEXT_COMPRESSION_INVALID",
+                "The summary model returned an invalid response.",
+            )
+        summary_text = self._message_text(response).strip()
+        if not summary_text:
+            raise fail(
+                "CONTEXT_COMPRESSION_EMPTY",
+                "The summary model returned an empty handoff.",
+            )
+        if self.accountant.estimate_text(summary_text) > self.context_summary_max_tokens:
+            raise fail(
+                "CONTEXT_COMPRESSION_TOO_LARGE",
+                "The generated handoff summary exceeds its token budget.",
+            )
+
+        next_summaries = [
+            *summaries,
+            {"summary_id": summary_id, "content": summary_text},
+        ]
+        outputs = self.tool_output_archive.list_outputs(self._session_id)
+        evidence = {
+            "kind": "tool_evidence_manifest",
+            "session_id": self._session_id,
+            "total_outputs": len(outputs),
+            "outputs": outputs[-200:],
+            "lookup": "Use list_tool_outputs and read_tool_output for complete evidence.",
+        }
+        recent_inputs = self._recent_user_inputs(
+            messages,
+            self.context_recent_user_inputs_max_tokens,
+        )
+        replacement_messages: list[BaseMessage] = [
+            *[
+                SystemMessage(
+                    content=f"[{item['summary_id']}]\n{item['content']}",
+                    additional_kwargs={
+                        "origin": "context_summary",
+                        "summary_id": item["summary_id"],
+                    },
+                )
+                for item in next_summaries
+            ],
+            SystemMessage(
+                content=json.dumps(evidence, ensure_ascii=False),
+                additional_kwargs={"origin": "tool_evidence_manifest"},
+            ),
+            *recent_inputs,
+        ]
+        result = self.graph.update_state(
+            config,
+            {
+                "messages": [
+                    RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                    *replacement_messages,
+                ]
+            },
+        )
+        result_checkpoint_id = str(result["configurable"]["checkpoint_id"])
+        compressed_tokens = self._estimate_context(replacement_messages)
+        self.accountant.mark_compressed("llm_handoff_summary", compressed_tokens)
+        self.accountant.update_estimate(
+            compressed_tokens,
+            len(replacement_messages),
+            force=True,
+        )
+        return {
+            "checkpoint_id": result_checkpoint_id,
+            "summary_id": summary_id,
+            "summary": summary_text,
+            "summaries": next_summaries,
+            "usage": self.accountant.snapshot(),
+        }
+
+    def _recent_user_inputs(
+        self,
+        messages: list[BaseMessage],
+        token_budget: int,
+    ) -> list[HumanMessage]:
+        """Select newest real user inputs, then restore chronological order."""
+        selected: list[HumanMessage] = []
+        used = 0
+        for message in reversed(messages):
+            if not isinstance(message, HumanMessage):
+                continue
+            origin = message.additional_kwargs.get("origin", "user")
+            if origin != "user":
+                continue
+            tokens = self._estimate_context([message], include_static=False)
+            remaining = token_budget - used
+            if tokens > remaining:
+                content = self._message_text(message)
+                low, high = 0, len(content)
+                while low < high:
+                    midpoint = (low + high + 1) // 2
+                    candidate = message.model_copy(update={"content": content[-midpoint:]})
+                    candidate_tokens = self._estimate_context(
+                        [candidate],
+                        include_static=False,
+                    )
+                    if candidate_tokens <= remaining:
+                        low = midpoint
+                    else:
+                        high = midpoint - 1
+                if low:
+                    selected.append(
+                        message.model_copy(update={"content": content[-low:]})
+                    )
+                break
+            selected.append(message)
+            used += tokens
+        selected.reverse()
+        return selected
 
     def _maybe_compress_context(
         self,
@@ -659,7 +968,9 @@ class AgentRuntime:
         invalid_retries = 0
         while True:
             self._raise_if_cancelled(cancelled, thread_id, cancellation_code)
-            self._maybe_compress_context(config, recorder, value)
+            guarded = self._guard_context_budget(config, value)
+            if guarded is not None:
+                return guarded
             result = self._stream_graph(
                 value,
                 config,
@@ -737,6 +1048,47 @@ class AgentRuntime:
                 )
             invalid_retries += 1
             value = {"messages": responses}
+
+    def _guard_context_budget(
+        self,
+        config: RunnableConfig,
+        pending_value: Any,
+    ) -> dict[str, Any] | None:
+        """End the turn without another model sample when its input is unsafe."""
+        if not hasattr(self, "context_config") or not hasattr(self, "accountant"):
+            return None
+        state = self.graph.get_state(config)
+        messages = list(getattr(state, "values", {}).get("messages", []))
+        pending = self._pending_messages(pending_value)
+        estimated = self._estimate_context(messages, pending)
+        safe_limit = self.context_config.hard_limit - max(
+            self.context_config.max_output_tokens,
+            self.context_config.min_reserved_tokens,
+        )
+        if estimated <= safe_limit:
+            return None
+        notice = AIMessage(
+            content=(
+                "上下文预算已耗尽，本轮已安全结束。系统将在 turn 提交后压缩上下文，"
+                "请在下一轮继续。"
+            ),
+            additional_kwargs={
+                "origin": "context_budget_guard",
+                "error_code": "CONTEXT_BUDGET_EXHAUSTED",
+            },
+        )
+        self.graph.update_state(
+            config,
+            {"messages": [*pending, notice]},
+        )
+        guarded_state = self.graph.get_state(config)
+        values = dict(getattr(guarded_state, "values", {}))
+        self.accountant.update_estimate(
+            estimated,
+            len(messages) + len(pending),
+            force=True,
+        )
+        return values
 
     def _repair_unresolved_invalid_tool_calls(self, config: RunnableConfig) -> None:
         """Remove legacy invalid calls that have no adjacent ToolMessage response."""
@@ -976,6 +1328,7 @@ class AgentRuntime:
         self.skill_execution.close()
         self.mcp_provider.close()
         self.execution_service.close()
+        self.tool_output_archive.close()
 
     def _approve_request(
         self,

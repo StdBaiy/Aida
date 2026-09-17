@@ -88,6 +88,36 @@ class FakeHost:
     def cancel_operation(self, operation_id: str) -> dict[str, Any]:
         return {"operation_id": operation_id, "status": "cancel_requested"}
 
+    def context(self, session_id: str) -> dict[str, Any]:
+        return {
+            "context_owner_id": f"main:{session_id}:timeline",
+            "session_id": session_id,
+            "timeline_id": "timeline",
+            "used_tokens": 800,
+            "max_tokens": 1_000,
+            "usage_ratio": 0.8,
+            "message_count": 4,
+            "compression_count": 0,
+            "updated_at": "2026-09-17T00:00:00Z",
+        }
+
+    def turn_context(self, session_id: str, turn_number: int) -> dict[str, Any]:
+        return {
+            "turn": {"turn_number": turn_number},
+            "context": {
+                "checkpoint_id": "checkpoint",
+                "message_count": 1,
+                "messages": [{"type": "human", "content": f"{session_id}:{turn_number}"}],
+            },
+        }
+
+    def submit_context_compaction(self, **values: Any) -> dict[str, Any]:
+        return {
+            "operation_id": "compact-operation",
+            "status": "queued",
+            **values,
+        }
+
 
 def test_web_host_requests_approval_only_for_skill_activation() -> None:
     host = CodingAgentHost.__new__(CodingAgentHost)
@@ -343,6 +373,45 @@ def test_session_operation_slots_are_independent() -> None:
         second.operation_lock.release()
 
 
+def test_empty_session_context_does_not_create_baseline_turn() -> None:
+    host = CodingAgentHost.__new__(CodingAgentHost)
+    host.workspace = SimpleNamespace(root=Path("/tmp/workspace"))
+    host.repository = SimpleNamespace(
+        validate_workspace=lambda session_id, _workspace: SimpleNamespace(
+            session_id=session_id
+        ),
+        active_timeline=lambda _session_id: SimpleNamespace(
+            timeline_id="timeline",
+            thread_id="thread",
+            head_checkpoint_id=None,
+        ),
+        context_state=lambda _owner_id: None,
+        turns=lambda _timeline_id: [],
+    )
+    host._runner = lambda _session_id: SimpleNamespace(  # type: ignore[method-assign]
+        runtime=SimpleNamespace(
+            accountant=SimpleNamespace(
+                snapshot=lambda: {
+                    "used_tokens": 0,
+                    "max_tokens": 128_000,
+                    "usage_ratio": 0.0,
+                }
+            )
+        ),
+        coordinator=SimpleNamespace(
+            ensure_baseline=lambda: (_ for _ in ()).throw(
+                AssertionError("context query must not initialize baseline")
+            )
+        ),
+    )
+
+    result = host.context("session")
+
+    assert result["used_tokens"] == 0
+    assert result["timeline_id"] == "timeline"
+    assert result["context_owner_id"] == "main:session:timeline"
+
+
 def test_session_can_be_created_while_an_existing_session_is_running() -> None:
     host = CodingAgentHost.__new__(CodingAgentHost)
     host.workspace = SimpleNamespace()
@@ -494,3 +563,18 @@ def test_api_bootstrap_cookie_csrf_and_origin() -> None:
             headers={"X-CSRF-Token": csrf_token},
         )
         assert cancelled.json()["status"] == "cancel_requested"
+        context = client.get("/api/v1/sessions/session/context")
+        assert context.json()["used_tokens"] == 800
+        turn_context = client.get("/api/v1/sessions/session/turns/3/context")
+        assert turn_context.status_code == 200
+        assert turn_context.json()["context"]["messages"][0]["content"] == "session:3"
+        compact = client.post(
+            "/api/v1/sessions/session/context/compact",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "expected_timeline_id": "timeline",
+                "client_request_id": "request-compact",
+            },
+        )
+        assert compact.status_code == 202
+        assert compact.json()["operation_id"] == "compact-operation"

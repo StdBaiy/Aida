@@ -18,6 +18,11 @@ class RestoreRequest(BaseModel):
     expected_timeline_id: str
 
 
+class CompactContextRequest(BaseModel):
+    expected_timeline_id: str
+    client_request_id: str = Field(min_length=8, max_length=128)
+
+
 class ApprovalDecision(BaseModel):
     operation_id: str
     request_hash: str
@@ -34,6 +39,15 @@ class SettingsUpdate(BaseModel):
     subagent_model_call_limit: int = Field(ge=1, le=200)
     command_timeout_seconds: int = Field(ge=1, le=1800)
     max_parallel_sessions: int = Field(ge=1, le=16)
+    context_auto_compact_ratio: float = Field(default=0.8, ge=0.5, le=0.95)
+    context_recent_user_inputs_max_tokens: int = Field(
+        default=2_000,
+        ge=256,
+        le=8_000,
+    )
+    context_summary_max_tokens: int = Field(default=4_000, ge=512, le=16_000)
+    context_compaction_enabled: bool = True
+    context_window_tokens: int | None = Field(default=None, ge=8_192)
 
     @field_validator("model", "langsmith_project")
     @classmethod

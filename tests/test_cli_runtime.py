@@ -5,7 +5,13 @@ from typing import Any, cast
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
-from coding_agent.cli import _approve_request, _StreamingOutput, build_parser, build_web_parser
+from coding_agent.cli import (
+    _approve_request,
+    _interactive,
+    _StreamingOutput,
+    build_parser,
+    build_web_parser,
+)
 from coding_agent.config import AgentConfig, load_config, save_non_secret_config
 from coding_agent.runtime import AgentRuntime, approve_by_default
 
@@ -16,6 +22,28 @@ class FakeStreamingGraph:
         yield "messages", (AIMessageChunk(content="hello "), {})
         yield "messages", (AIMessageChunk(content="world"), {})
         yield "values", {"messages": [AIMessage(content="hello world")]}
+
+
+def test_cli_context_and_compact_commands(capsys: Any) -> None:
+    commands = iter(["/context", "/compact", "/quit"])
+    reader = SimpleNamespace(read=lambda _prompt: next(commands))
+    coordinator = SimpleNamespace(
+        context_snapshot=lambda: {
+            "used_tokens": 800,
+            "max_tokens": 1_000,
+            "usage_ratio": 0.8,
+        },
+        compact_context=lambda **_kwargs: {
+            "text": "上下文压缩完成：800 -> 120 tokens，已生成 summary_000"
+        },
+    )
+
+    _interactive(cast(Any, coordinator), cast(Any, SimpleNamespace()), reader)
+
+    output = capsys.readouterr().out
+    assert '"used_tokens": 800' in output
+    assert "正在生成交接摘要" in output
+    assert "summary_000" in output
 
 
 def test_langsmith_is_disabled_without_credentials(tmp_path: Path, monkeypatch: Any) -> None:
@@ -424,6 +452,11 @@ def test_browser_settings_persist_without_api_keys(tmp_path: Path) -> None:
     assert saved == {
         "base_url": "https://api.example.com/v1",
         "command_timeout_seconds": 300,
+        "context_auto_compact_ratio": 0.8,
+        "context_compaction_enabled": True,
+        "context_recent_user_inputs_max_tokens": 2000,
+        "context_summary_max_tokens": 4000,
+        "context_window_tokens": None,
         "langsmith_enabled": True,
         "langsmith_project": "next-project",
         "main_agent_model_call_limit": 20,

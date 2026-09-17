@@ -1,7 +1,11 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+from coding_agent.errors import CodingAgentError
 from coding_agent.models import Workspace
 from coding_agent.repository import SqliteCheckpointRepository, new_id
 
@@ -80,6 +84,32 @@ def test_fork_keeps_visible_history_and_continues_numbering(tmp_path: Path) -> N
     repository.close()
 
 
+def test_turn_timing_is_persisted_with_millisecond_precision(tmp_path: Path) -> None:
+    repository, workspace = make_repository(tmp_path)
+    session = repository.create_session(workspace, "test-model")
+    timeline = repository.active_timeline(session.session_id)
+    turn = repository.add_turn(
+        timeline_id=timeline.timeline_id,
+        checkpoint_id="checkpoint",
+        snapshot_oid="snapshot",
+        user_text="request",
+        assistant_text="response",
+    )
+    started_at = datetime(2026, 9, 18, 10, 0, 0, tzinfo=UTC)
+    completed_at = started_at + timedelta(milliseconds=12_345)
+
+    timed = repository.set_turn_timing(
+        turn.turn_id,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+
+    assert timed.started_at == started_at
+    assert timed.completed_at == completed_at
+    assert timed.duration_ms == 12_345
+    repository.close()
+
+
 def test_legacy_fork_turn_numbers_are_migrated(tmp_path: Path) -> None:
     repository, workspace = make_repository(tmp_path)
     session = repository.create_session(workspace, "test-model")
@@ -144,6 +174,11 @@ def test_existing_database_schema_can_be_opened(tmp_path: Path) -> None:
     repository = SqliteCheckpointRepository(path)
     version = repository.connection.execute("SELECT version FROM schema_migrations").fetchone()
     assert version["version"] == 1
+    turn_columns = {
+        row["name"]
+        for row in repository.connection.execute("PRAGMA table_info(turns)").fetchall()
+    }
+    assert {"started_at", "completed_at", "duration_ms"} <= turn_columns
     repository.close()
 
 
@@ -228,4 +263,55 @@ def test_repository_pages_can_be_read_from_web_request_thread(tmp_path: Path) ->
     assert [turn.user_text for turn in turns] == ["cross-thread"]
     assert before is None
     assert summaries[0]["title"] == "cross-thread"
+
+
+def test_context_state_round_trips_and_timeline_head_uses_compare_and_swap(
+    tmp_path: Path,
+) -> None:
+    repository, workspace = make_repository(tmp_path)
+    session = repository.create_session(workspace, "test-model")
+    timeline = repository.active_timeline(session.session_id)
+    repository.add_turn(
+        timeline_id=timeline.timeline_id,
+        checkpoint_id="checkpoint-1",
+        thread_id="thread-1",
+        snapshot_oid="snapshot-1",
+        user_text="hello",
+        assistant_text="world",
+        turn_number=1,
+    )
+    owner_id = f"main:{session.session_id}:{timeline.timeline_id}"
+
+    saved = repository.save_context_state(
+        context_owner_id=owner_id,
+        session_id=session.session_id,
+        timeline_id=timeline.timeline_id,
+        attempt_id=None,
+        snapshot={
+            "used_tokens": 800,
+            "max_tokens": 1_000,
+            "usage_ratio": 0.8,
+            "message_count": 4,
+            "compression_count": 0,
+        },
+    )
+
+    assert saved.used_tokens == 800
+    assert repository.context_state(owner_id) == saved
+    assert repository.active_timeline(session.session_id).head_checkpoint_id == "checkpoint-1"
+
+    repository.set_timeline_head(
+        timeline.timeline_id,
+        thread_id="thread-2",
+        checkpoint_id="checkpoint-2",
+        expected_checkpoint_id="checkpoint-1",
+    )
+    with pytest.raises(CodingAgentError, match="timeline head changed"):
+        repository.set_timeline_head(
+            timeline.timeline_id,
+            thread_id="thread-3",
+            checkpoint_id="checkpoint-3",
+            expected_checkpoint_id="checkpoint-1",
+        )
+    repository.close()
     repository.close()

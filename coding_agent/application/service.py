@@ -11,6 +11,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from coding_agent.config import (
 )
 from coding_agent.coordinator import TurnCancelled, TurnCoordinator
 from coding_agent.errors import CodingAgentError, fail
-from coding_agent.models import SessionRecord
+from coding_agent.models import SessionRecord, utc_now
 from coding_agent.prompting import event_text
 from coding_agent.repository import SqliteCheckpointRepository
 from coding_agent.runtime import AgentRuntime, approve_by_default
@@ -152,6 +153,7 @@ class CodingAgentHost:
                 checkpoint_path=self.workspace.data_dir / "checkpoints.db",
                 extra_tools=self.subagents.build_control_tools(session_id),
                 mutation_gate=self.mutation_gate,
+                session_id=session_id,
             )
             runner = _SessionRunner(
                 runtime=runtime,
@@ -261,6 +263,13 @@ class CodingAgentHost:
             "subagent_model_call_limit": self.config.subagent_model_call_limit,
             "command_timeout_seconds": self.config.command_timeout_seconds,
             "max_parallel_sessions": self.config.max_parallel_sessions,
+            "context_auto_compact_ratio": self.config.context_auto_compact_ratio,
+            "context_recent_user_inputs_max_tokens": (
+                self.config.context_recent_user_inputs_max_tokens
+            ),
+            "context_summary_max_tokens": self.config.context_summary_max_tokens,
+            "context_compaction_enabled": self.config.context_compaction_enabled,
+            "context_window_tokens": self.config.context_window_tokens,
             "sandbox_enabled": self.config.sandbox_enabled,
             "sandbox_provider": self.config.sandbox_provider,
             "sandbox_image": self.config.sandbox_image,
@@ -302,6 +311,7 @@ class CodingAgentHost:
             checkpoint_path=self.workspace.data_dir / "checkpoints.db",
             extra_tools=self.subagents.build_control_tools(self.session_id),
             mutation_gate=self.mutation_gate,
+            session_id=self.session_id,
         )
         new_exporter = MetricsLangSmithExporter(
             self.trace_store,
@@ -398,9 +408,52 @@ class CodingAgentHost:
             "session_id": session_id,
             "timeline_id": timeline_id,
             "turns": [turn.model_dump(mode="json") for turn in turns],
+            "notices": self.repository.conversation_notices(
+                session_id=session_id,
+                timeline_id=timeline_id,
+            ),
             "next_before_turn_number": next_before,
         }
         return result
+
+    def context(self, session_id: str) -> dict[str, Any]:
+        """Return the durable context snapshot for the active timeline."""
+        session = self.repository.validate_workspace(session_id, self.workspace)
+        timeline = self.repository.active_timeline(session.session_id)
+        owner_id = f"main:{session.session_id}:{timeline.timeline_id}"
+        state = self.repository.context_state(owner_id)
+        if state is None:
+            runner = self._runner(session_id)
+            turns = self.repository.turns(timeline.timeline_id)
+            if not turns:
+                return {
+                    **runner.runtime.accountant.snapshot(),
+                    "context_owner_id": owner_id,
+                    "session_id": session_id,
+                    "timeline_id": timeline.timeline_id,
+                    "attempt_id": None,
+                    "summaries": [],
+                    "last_compaction_id": None,
+                    "updated_at": utc_now().isoformat(),
+                }
+            else:
+                checkpoint_id = timeline.head_checkpoint_id or turns[-1].checkpoint_id
+                state = self.repository.save_context_state(
+                    context_owner_id=owner_id,
+                    session_id=session_id,
+                    timeline_id=timeline.timeline_id,
+                    attempt_id=None,
+                    snapshot=runner.runtime.measure_context(
+                        thread_id=timeline.thread_id,
+                        checkpoint_id=checkpoint_id,
+                    ),
+                )
+        return state.model_dump(mode="json")
+
+    def turn_context(self, session_id: str, turn_number: int) -> dict[str, Any]:
+        """Return one committed turn's model-visible checkpoint context."""
+        self.repository.validate_workspace(session_id, self.workspace)
+        return self._runner(session_id).coordinator.turn_context(turn_number)
 
     def submit_turn(
         self,
@@ -460,6 +513,7 @@ class CodingAgentHost:
         wake_id: str | None = None,
     ) -> None:
         completed = False
+        turn_started_at = utc_now()
         try:
             if cancelled.is_set():
                 raise fail("OPERATION_CANCELLED", "The Agent operation was cancelled.")
@@ -506,10 +560,6 @@ class CodingAgentHost:
             if cancelled.is_set():
                 raise fail("OPERATION_CANCELLED", "The Agent operation was cancelled.")
             self.journal.append(operation_id, "assistant.completed", {"text": response})
-            self.journal.emit_context_usage(
-                operation_id,
-                runner.runtime.accountant.snapshot(),
-            )
             timeline = self.repository.active_timeline(session_id)
             turn = self.repository.turns(timeline.timeline_id)[-1]
             self.journal.append(
@@ -522,7 +572,24 @@ class CodingAgentHost:
                     "snapshot_oid": turn.snapshot_oid,
                 },
             )
+            context_state = self.repository.context_state(
+                f"main:{session_id}:{timeline.timeline_id}"
+            )
+            self.journal.emit_context_usage(
+                operation_id,
+                (
+                    context_state.model_dump(mode="json")
+                    if context_state is not None
+                    else runner.runtime.accountant.snapshot()
+                ),
+            )
+            self._compact_after_turn(operation_id, runner)
             self.journal.append(operation_id, "workspace.changed", self.workspace_status())
+            self.repository.set_turn_timing(
+                turn.turn_id,
+                started_at=turn_started_at,
+                completed_at=utc_now(),
+            )
             self.journal.append(
                 operation_id,
                 "operation.completed",
@@ -543,6 +610,8 @@ class CodingAgentHost:
                         user_text=message,
                         thread_id=tc.execution_thread_id,
                         checkpoint_id=tc.checkpoint_id,
+                        runner=runner,
+                        started_at=turn_started_at,
                     )
                 except BaseException as persistence_error:
                     self.journal.append(
@@ -561,6 +630,8 @@ class CodingAgentHost:
                             operation_id=operation_id,
                             session_id=session_id,
                             user_text=message,
+                            runner=runner,
+                            started_at=turn_started_at,
                         )
                     except BaseException as persistence_error:
                         self.journal.append(
@@ -599,6 +670,8 @@ class CodingAgentHost:
         user_text: str,
         thread_id: str | None = None,
         checkpoint_id: str | None = None,
+        runner: _SessionRunner | None = None,
+        started_at: datetime | None = None,
     ) -> None:
         """Persist a cancelled interaction, promoting its thread so the context survives."""
         timeline = self.repository.active_timeline(session_id)
@@ -626,14 +699,31 @@ class CodingAgentHost:
             )
         elif not partial_response.strip():
             partial_response = "已取消，本轮未产生完整回复。"
+        committed_thread_id = thread_id or timeline.thread_id
+        committed_checkpoint_id = checkpoint_id or parent.checkpoint_id
+        context_snapshot = (
+            runner.runtime.measure_context(
+                thread_id=committed_thread_id,
+                checkpoint_id=committed_checkpoint_id,
+            )
+            if runner is not None
+            else None
+        )
         self.repository.add_turn(
             timeline_id=timeline.timeline_id,
-            checkpoint_id=checkpoint_id or parent.checkpoint_id,
+            checkpoint_id=committed_checkpoint_id,
             thread_id=thread_id,
             snapshot_oid=parent.snapshot_oid,
             user_text=user_text,
             assistant_text=partial_response,
             status="cancelled",
+            started_at=started_at,
+            context_owner_id=(
+                f"main:{session_id}:{timeline.timeline_id}"
+                if context_snapshot is not None
+                else None
+            ),
+            context_snapshot=context_snapshot,
         )
 
     def _emit_token(self, operation_id: str, text: str) -> None:
@@ -695,6 +785,134 @@ class CodingAgentHost:
             if self._operation_lock.locked():
                 self._operation_lock.release()
             raise
+
+    def submit_context_compaction(
+        self,
+        *,
+        session_id: str,
+        expected_timeline_id: str,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        try:
+            self._ensure_idle()
+        except CodingAgentError as exc:
+            if exc.code == "WORKSPACE_BUSY":
+                raise fail(
+                    "TURN_ACTIVE",
+                    "Context compression is only available between turns.",
+                ) from exc
+            raise
+        try:
+            current = self.repository.active_timeline(session_id)
+            if current.timeline_id != expected_timeline_id:
+                raise fail("TIMELINE_CHANGED", "The session timeline already changed.")
+            operation_id, created = self.journal.create_operation(
+                session_id=session_id,
+                timeline_id=expected_timeline_id,
+                kind="context_compact",
+                client_request_id=client_request_id,
+            )
+            if created:
+                self._schedule_operation(
+                    operation_id,
+                    self._run_manual_context_compaction,
+                    operation_id,
+                    self._runner(session_id),
+                )
+            else:
+                self._operation_lock.release()
+            return {
+                "operation_id": operation_id,
+                "status": "queued" if created else "existing",
+                "events_url": f"/api/v1/operations/{operation_id}/events",
+            }
+        except BaseException:
+            if self._operation_lock.locked():
+                self._operation_lock.release()
+            raise
+
+    def _run_manual_context_compaction(
+        self,
+        operation_id: str,
+        runner: _SessionRunner,
+    ) -> None:
+        try:
+            self.journal.set_status(operation_id, "running")
+            self._run_context_compaction(
+                operation_id,
+                runner,
+                trigger="manual_web",
+                force=True,
+            )
+            self.journal.emit_context_usage(
+                operation_id,
+                runner.coordinator.context_snapshot(),
+            )
+            self.journal.append(
+                operation_id,
+                "operation.completed",
+                {"kind": "context_compact"},
+            )
+            self.journal.set_status(
+                operation_id,
+                "completed",
+                expected=("running",),
+            )
+        except BaseException as exc:
+            code = exc.code if isinstance(exc, CodingAgentError) else "RUNTIME_ERROR"
+            self.journal.append(
+                operation_id,
+                "context.compression.failed",
+                {"error": {"code": code, "message": str(exc)}},
+            )
+            self.journal.append(
+                operation_id,
+                "operation.failed",
+                {"error": {"code": code, "message": str(exc)}},
+            )
+            self.journal.set_status(operation_id, "failed", code)
+        finally:
+            self._operation_lock.release()
+
+    def _run_context_compaction(
+        self,
+        operation_id: str,
+        runner: _SessionRunner,
+        *,
+        trigger: str,
+        force: bool,
+    ) -> dict[str, Any] | None:
+        snapshot = runner.coordinator.context_snapshot()
+        threshold = self.config.context_auto_compact_ratio
+        if not force and float(snapshot.get("usage_ratio", 0.0)) < threshold:
+            return None
+        self.journal.append(
+            operation_id,
+            "context.compression.started",
+            {
+                "trigger": trigger,
+                "before_tokens": snapshot.get("used_tokens", 0),
+            },
+        )
+        self.journal.append(
+            operation_id,
+            "context.compression.progress",
+            {"phase": "generating"},
+        )
+        result = runner.coordinator.compact_context(trigger=trigger, force=force)
+        if result is None:
+            return None
+        self.journal.append(
+            operation_id,
+            "context.compression.progress",
+            {"phase": "applying"},
+        )
+        self.journal.append(
+            operation_id,
+            "context.compression.completed",
+            result,
+        )
+        return result
 
     def _run_restore(
         self,
@@ -840,6 +1058,32 @@ class CodingAgentHost:
         except BaseException:
             if runner.operation_lock.locked():
                 runner.operation_lock.release()
+
+    def _compact_after_turn(
+        self,
+        operation_id: str,
+        runner: _SessionRunner,
+    ) -> None:
+        """Run the single automatic decision allowed at a committed turn boundary."""
+        try:
+            result = self._run_context_compaction(
+                operation_id,
+                runner,
+                trigger="automatic",
+                force=False,
+            )
+            if result is not None:
+                self.journal.emit_context_usage(
+                    operation_id,
+                    runner.coordinator.context_snapshot(),
+                )
+        except BaseException as exc:
+            code = exc.code if isinstance(exc, CodingAgentError) else "RUNTIME_ERROR"
+            self.journal.append(
+                operation_id,
+                "context.compression.failed",
+                {"error": {"code": code, "message": str(exc)}},
+            )
             raise
 
     def resolve_approval(self, approval_id: str, body: dict[str, str]) -> dict[str, Any]:
@@ -1066,6 +1310,7 @@ class WorkspaceManager:
         "artifact",
         "cancel_subagent_task",
         "cancel_operation",
+        "context",
         "create_session",
         "diff",
         "file_content",
@@ -1079,8 +1324,10 @@ class WorkspaceManager:
         "subagent_runs",
         "subagent_demo",
         "submit_restore",
+        "submit_context_compaction",
         "submit_turn",
         "trace",
+        "turn_context",
         "turns",
         "workspace_status",
     }

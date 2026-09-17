@@ -465,6 +465,86 @@ button:disabled {
   letter-spacing: 0;
 }
 
+.context-ring {
+  display: inline-flex;
+  width: auto;
+  height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: #2f7d50;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+
+.context-ring.warning {
+  color: #a16207;
+}
+
+.context-ring.danger {
+  color: #c2413b;
+}
+
+.context-ring svg {
+  display: block;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  transform: rotate(-90deg);
+}
+
+.context-ring.compact svg {
+  width: 22px;
+  height: 22px;
+  flex-basis: 22px;
+}
+
+.context-ring.compact {
+  height: 22px;
+}
+
+.context-ring:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.context-ring.compressing svg {
+  animation: spin 0.9s linear infinite;
+}
+
+.context-ring circle {
+  fill: none;
+  stroke-width: 2.5;
+}
+
+.context-ring-track {
+  stroke: #dfe4df;
+}
+
+.context-ring-value {
+  stroke: currentColor;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 180ms ease, stroke 180ms ease;
+}
+
+.context-ring-percent {
+  min-width: 30px;
+  color: currentColor;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  line-height: 1;
+  text-align: left;
+}
+
+.context-ring.compact .context-ring-percent {
+  min-width: 26px;
+  font-size: 9px;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -486,6 +566,27 @@ button:disabled {
   min-height: 0;
   padding: 22px clamp(18px, 4vw, 52px) 20px;
   overflow-y: auto;
+}
+
+.system-notice {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.system-notice::before,
+.system-notice::after {
+  height: 1px;
+  flex: 1;
+  background: var(--line);
+  content: "";
+}
+
+.system-notice time {
+  white-space: nowrap;
 }
 
 .empty-conversation {
@@ -740,6 +841,12 @@ button:disabled {
 
 .cancelled-label {
   color: var(--danger);
+}
+
+.turn-duration {
+  color: var(--faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
 .running-label {
@@ -1379,8 +1486,67 @@ button:disabled {
 }
 
 .composer-wrap {
+  position: relative;
   padding: 8px clamp(16px, 3.5vw, 44px) 12px;
   background: transparent;
+}
+
+.slash-command-menu {
+  position: absolute;
+  z-index: 20;
+  right: clamp(16px, 3.5vw, 44px);
+  bottom: calc(100% - 8px);
+  left: clamp(16px, 3.5vw, 44px);
+  max-height: 286px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 12px 30px rgb(31 42 35 / 14%);
+}
+
+.slash-command-menu button {
+  display: grid;
+  width: 100%;
+  min-height: 42px;
+  grid-template-columns: 28px minmax(110px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.slash-command-menu button:hover,
+.slash-command-menu button.active {
+  background: #edf3ef;
+}
+
+.slash-command-icon {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.slash-command-menu strong {
+  font: 600 11px/1.3 "SFMono-Regular", Consolas, monospace;
+}
+
+.slash-command-menu small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer {
@@ -1831,6 +1997,126 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.shortcut-results {
+  min-height: 0;
+  padding: 8px;
+  overflow-y: auto;
+  background: #f7f9f7;
+}
+
+.shortcut-result {
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.shortcut-result > header {
+  display: grid;
+  min-height: 36px;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border-bottom: 1px solid var(--line);
+}
+
+.shortcut-result > header code {
+  overflow: hidden;
+  color: #26362e;
+  font: 600 10px/1.4 "SFMono-Regular", Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shortcut-result > header time {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.shortcut-result-status {
+  display: grid;
+  color: var(--accent);
+  place-items: center;
+}
+
+.shortcut-result.error .shortcut-result-status {
+  color: var(--danger);
+}
+
+.shortcut-result-loading,
+.shortcut-result-error {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.shortcut-result-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.json-viewer {
+  padding: 8px 10px 10px;
+  overflow-x: auto;
+  color: #34423a;
+  background: #fbfcfb;
+  font: 9px/1.6 "SFMono-Regular", Consolas, monospace;
+}
+
+.json-node {
+  min-width: max-content;
+}
+
+.json-node summary {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  cursor: pointer;
+  list-style-position: outside;
+}
+
+.json-children {
+  margin-left: 13px;
+  padding-left: 9px;
+  border-left: 1px solid #dfe5e0;
+}
+
+.json-leaf {
+  display: flex;
+  min-height: 18px;
+  align-items: baseline;
+  gap: 7px;
+  white-space: pre-wrap;
+}
+
+.json-key {
+  color: #315f86;
+}
+
+.json-key::after {
+  color: #7d8781;
+  content: ":";
+}
+
+.json-kind,
+.json-empty {
+  color: #8a938d;
+}
+
+.json-value.string {
+  color: #397246;
+}
+
+.json-value.number {
+  color: #98601e;
+}
+
+.json-value.boolean,
+.json-value.null {
+  color: #875394;
+}
+
 .inspector-footer {
   display: flex;
   align-items: center;
@@ -2195,7 +2481,8 @@ button:disabled {
 }
 
 .setting-field > span,
-.settings-switch-row strong {
+.settings-switch-row strong,
+.context-switch-row strong {
   color: #4c554f;
   font-size: 10px;
   font-weight: 650;
@@ -2246,7 +2533,8 @@ button:disabled {
   font-size: 10px;
 }
 
-.settings-switch-row {
+.settings-switch-row,
+.context-switch-row {
   display: flex;
   min-height: 45px;
   align-items: center;
@@ -2258,18 +2546,21 @@ button:disabled {
   background: var(--panel-muted);
 }
 
-.settings-switch-row > span {
+.settings-switch-row > span,
+.context-switch-row > span {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.settings-switch-row small {
+.settings-switch-row small,
+.context-switch-row small {
   color: var(--muted);
   font-size: 9px;
 }
 
-.settings-switch-row input {
+.settings-switch-row input,
+.context-switch-row input {
   width: 30px;
   height: 17px;
   accent-color: var(--accent);

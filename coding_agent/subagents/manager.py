@@ -1197,8 +1197,13 @@ class SubagentDemoManager:
                 allowed_mcp_tool_names=frozenset(contract["mcp_tools"]),
                 role_instruction=role_instruction,
                 model_call_limit=config.subagent_model_call_limit,
+                session_id=str(task["session_id"]),
             )
             try:
+                current_attempt = self.repository.attempt(attempt_id)
+                context_snapshot_json = current_attempt.get("context_snapshot_json")
+                if context_snapshot_json and hasattr(runtime, "accountant"):
+                    runtime.accountant.restore(json.loads(str(context_snapshot_json)))
                 if not thread_initialized:
                     checkpoint_id = runtime.initialize_thread(thread_id)
                     self.repository.update_attempt(
@@ -1222,10 +1227,16 @@ class SubagentDemoManager:
                         payload,
                     ),
                 )
-                self.repository.update_attempt(
-                    attempt_id,
-                    checkpoint_id=checkpoint_id,
-                )
+                update: dict[str, Any] = {"checkpoint_id": checkpoint_id}
+                if hasattr(runtime, "measure_context"):
+                    update["context_snapshot_json"] = json.dumps(
+                        runtime.measure_context(
+                            thread_id=thread_id,
+                            checkpoint_id=checkpoint_id,
+                        ),
+                        ensure_ascii=False,
+                    )
+                self.repository.update_attempt(attempt_id, **update)
                 return response
             finally:
                 runtime.close()

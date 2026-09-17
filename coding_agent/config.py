@@ -82,6 +82,17 @@ class AgentConfig(BaseModel):
     max_parallel_tools: int = Field(default=4, ge=1, le=16)
     tool_probe_interval_seconds: int = Field(default=15, ge=1, le=300)
     max_tool_scheduler_wakes: int = Field(default=20, ge=1, le=100)
+    context_auto_compact_ratio: float = Field(default=0.8, ge=0.5, le=0.95)
+    context_recent_user_inputs_max_tokens: int = Field(default=2_000, ge=256, le=8_000)
+    context_summary_max_tokens: int = Field(default=4_000, ge=512, le=16_000)
+    context_compaction_enabled: bool = True
+    context_window_tokens: int | None = Field(default=None, ge=8_192)
+    tool_output_preview_tokens: int = Field(default=1_200, ge=128, le=8_000)
+    tool_output_read_max_bytes: int = Field(
+        default=32_768,
+        ge=4_096,
+        le=1_048_576,
+    )
     langsmith_enabled: bool = False
     langsmith_project: str = "coding-agent-evaluation"
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
@@ -246,6 +257,24 @@ def load_config(
         or raw.get("main_agent_model_call_limit", 20),
         "subagent_model_call_limit": os.getenv("CODING_AGENT_SUBAGENT_MODEL_CALL_LIMIT")
         or raw.get("subagent_model_call_limit", 20),
+        "context_auto_compact_ratio": os.getenv(
+            "CODING_AGENT_CONTEXT_AUTO_COMPACT_RATIO"
+        )
+        or raw.get("context_auto_compact_ratio", 0.8),
+        "context_recent_user_inputs_max_tokens": os.getenv(
+            "CODING_AGENT_CONTEXT_RECENT_USER_INPUTS_MAX_TOKENS"
+        )
+        or raw.get("context_recent_user_inputs_max_tokens", 2_000),
+        "context_summary_max_tokens": os.getenv(
+            "CODING_AGENT_CONTEXT_SUMMARY_MAX_TOKENS"
+        )
+        or raw.get("context_summary_max_tokens", 4_000),
+        "context_compaction_enabled": os.getenv(
+            "CODING_AGENT_CONTEXT_COMPACTION_ENABLED"
+        )
+        or raw.get("context_compaction_enabled", True),
+        "context_window_tokens": os.getenv("CODING_AGENT_CONTEXT_WINDOW_TOKENS")
+        or raw.get("context_window_tokens"),
         "sandbox_enabled": os.getenv("CODING_AGENT_SANDBOX_ENABLED")
         or raw.get("sandbox_enabled", True),
         "sandbox_provider": os.getenv("CODING_AGENT_SANDBOX_PROVIDER")
@@ -279,6 +308,13 @@ def save_non_secret_config(config: AgentConfig, config_path: Path | None) -> Non
             "subagent_model_call_limit": config.subagent_model_call_limit,
             "command_timeout_seconds": config.command_timeout_seconds,
             "max_parallel_sessions": config.max_parallel_sessions,
+            "context_auto_compact_ratio": config.context_auto_compact_ratio,
+            "context_recent_user_inputs_max_tokens": (
+                config.context_recent_user_inputs_max_tokens
+            ),
+            "context_summary_max_tokens": config.context_summary_max_tokens,
+            "context_compaction_enabled": config.context_compaction_enabled,
+            "context_window_tokens": config.context_window_tokens,
         }
     )
     _write_raw_config(path, existing)

@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS subagent_attempts (
     workspace_state TEXT NOT NULL DEFAULT 'unallocated',
     thread_id TEXT,
     checkpoint_id TEXT,
+    context_snapshot_json TEXT,
     UNIQUE(task_id, attempt_number)
 );
 CREATE TABLE IF NOT EXISTS subagent_events (
@@ -348,6 +349,10 @@ class SubagentRepository:
             if "checkpoint_id" not in attempt_columns:
                 self.connection.execute(
                     "ALTER TABLE subagent_attempts ADD COLUMN checkpoint_id TEXT"
+                )
+            if "context_snapshot_json" not in attempt_columns:
+                self.connection.execute(
+                    "ALTER TABLE subagent_attempts ADD COLUMN context_snapshot_json TEXT"
                 )
 
     def create_run(
@@ -708,6 +713,7 @@ class SubagentRepository:
             "allowed_tools_json",
             "thread_id",
             "checkpoint_id",
+            "context_snapshot_json",
         }
         if unknown := set(values) - allowed:
             raise ValueError(f"Unknown attempt fields: {sorted(unknown)}")
@@ -1036,6 +1042,10 @@ class SubagentRepository:
             item["allowed_tools"] = json.loads(item.pop("allowed_tools_json"))
             envelope = item.pop("result_envelope_json", None)
             item["result"] = json.loads(envelope) if envelope else None
+            context_snapshot = item.pop("context_snapshot_json", None)
+            item["context_usage"] = (
+                json.loads(context_snapshot) if context_snapshot else None
+            )
             attempts_by_task.setdefault(str(item["task_id"]), []).append(item)
         events_by_task: dict[str, list[dict[str, Any]]] = {}
         for row in event_rows:

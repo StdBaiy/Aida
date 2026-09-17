@@ -73,6 +73,7 @@ class TimelineRecord(BaseModel):
     session_id: str
     thread_id: str
     status: TimelineStatus
+    head_checkpoint_id: str | None = None
     forked_from_timeline_id: str | None = None
     forked_from_turn_number: int | None = None
     created_at: datetime
@@ -90,6 +91,33 @@ class TurnRecord(BaseModel):
     assistant_text: str
     status: str = "completed"
     created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
+
+
+class AgentContextState(BaseModel):
+    """Latest durable context-window state for one Agent owner."""
+
+    context_owner_id: str
+    session_id: str
+    timeline_id: str | None = None
+    attempt_id: str | None = None
+    used_tokens: int = 0
+    max_tokens: int
+    usage_ratio: float = 0.0
+    message_count: int = 0
+    compression_count: int = 0
+    last_strategy: str | None = None
+    last_prompt_tokens: int = 0
+    last_completion_tokens: int = 0
+    cumulative_prompt_tokens: int = 0
+    cumulative_completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    summaries: list[dict[str, str]] = Field(default_factory=list)
+    last_compaction_id: str | None = None
+    updated_at: datetime
 
 
 @dataclass(frozen=True)

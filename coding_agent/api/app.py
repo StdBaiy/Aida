@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from coding_agent.api.schemas import (
     ApprovalDecision,
+    CompactContextRequest,
     RestoreRequest,
     SettingsUpdate,
     TurnRequest,
@@ -89,6 +90,7 @@ def create_app(
                 "APPROVAL_EXPIRED",
                 "APPROVAL_MISMATCH",
                 "WORKSPACE_ACTIVE",
+                "TURN_ACTIVE",
             }
             else 400
         )
@@ -184,6 +186,24 @@ def create_app(
             session_id,
             limit=limit,
             before_turn_number=before_turn_number,
+        )
+
+    @app.get("/api/v1/sessions/{session_id}/context")
+    async def context(session_id: str) -> dict[str, Any]:
+        return host.context(session_id)
+
+    @app.get("/api/v1/sessions/{session_id}/turns/{turn_number}/context")
+    async def turn_context(session_id: str, turn_number: int) -> dict[str, Any]:
+        return host.turn_context(session_id, turn_number)
+
+    @app.post("/api/v1/sessions/{session_id}/context/compact", status_code=202)
+    async def compact_context(
+        session_id: str,
+        body: CompactContextRequest,
+    ) -> dict[str, Any]:
+        return host.submit_context_compaction(
+            session_id=session_id,
+            **body.model_dump(),
         )
 
     @app.post("/api/v1/sessions/{session_id}/turns", status_code=202)

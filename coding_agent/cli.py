@@ -98,6 +98,8 @@ def _print_help() -> None:
     print(
         "/help                 Show commands\n"
         "/status               Show active session and timeline\n"
+        "/context              Show context window usage\n"
+        "/compact              Compact context at the idle turn boundary\n"
         "/history              Show committed turns\n"
         "/trace <turn>         Show a local trace summary\n"
         "/restore <turn>       Fork and jointly restore a historical turn\n"
@@ -159,6 +161,28 @@ def _interactive(
             continue
         if text == "/history":
             print(json.dumps(coordinator.history(), indent=2, ensure_ascii=False))
+            continue
+        if text == "/context":
+            print(
+                json.dumps(
+                    coordinator.context_snapshot(),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            continue
+        if text == "/compact":
+            try:
+                print("system> 正在准备上下文压缩")
+                print("system> 正在生成交接摘要")
+                result = coordinator.compact_context(trigger="manual_cli", force=True)
+                if result is None:
+                    print("system> 上下文压缩未启用")
+                    continue
+                print("system> 正在重建上下文")
+                print(f"system> {result['text']}")
+            except CodingAgentError as exc:
+                _print_error(exc)
             continue
         if text.startswith("/trace "):
             try:
@@ -252,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
                     workspace_root=workspace.root,
                     repo_root=workspace.repo_root,
                     checkpoint_path=workspace.data_dir / "checkpoints.db",
+                    session_id=session.session_id,
                 )
                 coordinator = TurnCoordinator(
                     session_id=session.session_id,

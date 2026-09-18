@@ -8,10 +8,9 @@ from typing import Any
 import pytest
 
 from coding_agent.config import AgentConfig
-from coding_agent.errors import CodingAgentError, fail
+from coding_agent.errors import fail
 from coding_agent.subagents import SubagentDemoManager
 from coding_agent.subagents.results import build_result_envelope
-from coding_agent.subagents.tools import AttemptToolRuntime
 from coding_agent.tracing.context import activate_recorder
 from coding_agent.workspace import resolve_workspace
 
@@ -34,20 +33,6 @@ def repository(tmp_path: Path) -> Path:
     git(tmp_path, "add", "README.md")
     git(tmp_path, "commit", "-m", "baseline")
     return tmp_path
-
-
-def test_attempt_runtime_rejects_tools_not_granted(tmp_path: Path) -> None:
-    runtime = AttemptToolRuntime(
-        workspace=tmp_path,
-        allowed_tools=("write_deliverable",),
-        cancelled=threading.Event(),
-        on_event=lambda _event, _payload: None,
-    )
-
-    with pytest.raises(CodingAgentError) as error:
-        runtime.invoke("mock_sleep", {"seconds": 10})
-
-    assert error.value.code == "SUBAGENT_TOOL_FORBIDDEN"
 
 
 def test_unstructured_child_output_is_not_used_as_result_summary() -> None:
@@ -80,68 +65,6 @@ def test_structured_child_result_preserves_provenance() -> None:
 
     assert result.summary == "Located the scheduler behavior."
     assert result.provenance[0].provider == "deep_wiki"
-
-
-def test_demo_runs_two_tasks_and_revises_failed_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = repository(tmp_path)
-    started = threading.Barrier(2)
-    sleep_calls = 0
-    sleep_lock = threading.Lock()
-
-    def fast_sleep(
-        self: AttemptToolRuntime,
-        seconds: int = 10,
-    ) -> dict[str, Any]:
-        nonlocal sleep_calls
-        del self
-        with sleep_lock:
-            sleep_calls += 1
-            call_number = sleep_calls
-        if call_number <= 2:
-            started.wait(timeout=3)
-        return {"slept_seconds": seconds, "duration_ms": seconds * 1000}
-
-    monkeypatch.setattr(AttemptToolRuntime, "_mock_sleep", fast_sleep)
-    manager = SubagentDemoManager(resolve_workspace(root))
-    try:
-        created = manager.start_demo("session-1")
-        assert created["status"] == "running"
-        assert len(created["tasks"]) == 2
-
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            result = manager.inspect(created["run_id"])
-            if result["status"] != "running":
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("subagent demo did not finish")
-
-        assert result["status"] == "completed"
-        tasks = {task["name"]: task for task in result["tasks"]}
-        assert tasks["Agent A"]["status"] == "merged"
-        assert len(tasks["Agent A"]["attempts"]) == 1
-        assert tasks["Agent B"]["status"] == "merged"
-        assert len(tasks["Agent B"]["attempts"]) == 2
-        assert tasks["Agent B"]["attempts"][0]["status"] == "rejected"
-        assert tasks["Agent B"]["attempts"][1]["status"] == "accepted"
-        assert tasks["Agent B"]["feedback"]
-        assert any(
-            event["event_type"] == "parent.feedback"
-            for event in tasks["Agent B"]["events"]
-        )
-        worktrees = {
-            attempt["worktree_path"]
-            for task in result["tasks"]
-            for attempt in task["attempts"]
-        }
-        assert len(worktrees) == 3
-        assert None not in worktrees
-    finally:
-        manager.close()
 
 
 def test_main_agent_can_dispatch_two_isolated_tasks_and_integrate_results(

@@ -271,14 +271,7 @@ Web 顶部的 Settings 可修改模型、Base URL、模型调用超时、命令�
 后会热重建 Runtime，从下一轮对话开始生效，并将非敏感配置写回本地配置文件。模型和
 LangSmith API Key 始终只从 Host 启动时的环境变量读取，不会进入页面、数据库或配置文件。
 
-工作台的“运行双 Agent Demo”会并行启动两个后台子 Agent。每个 Attempt 使用独立 Git
-worktree，并且只能调用主 Agent 下发的 `mock_sleep` 和 `write_deliverable` 工具。两个
-首次 Attempt 都会真实运行至少 10 秒：Agent A 直接通过验收，Agent B 首次失败并接收
-结构化反馈，再从失败 commit 创建第二个 Attempt 完成返工。验收结果发布到
-`refs/coding-agent/subagent-integrations/<run_id>/<task_id>`，不会修改当前检出分支。
-任务、Attempt 和进度事件保存在仓库的 `coding-agent/agent.db` 中，页面刷新后仍可恢复。
-
-主 Agent也可以通过 `create_agent_tasks` 原子创建最多两个真实子 Agent，并用
+主 Agent 可以通过 `create_agent_tasks` 原子创建最多两个真实子 Agent，并用
 `inspect_agent_task`、`wait_agent_tasks`、`request_agent_revision` 和
 `accept_agent_result` 完成监控、返工和验收。子 Agent运行完整 Agent Runtime，但只能
 看到任务契约授予的工具。`workspace_mode=none|auto|required` 控制 worktree 分配；

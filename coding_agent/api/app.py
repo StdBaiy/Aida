@@ -210,21 +210,9 @@ def create_app(
     async def create_turn(session_id: str, body: TurnRequest) -> dict[str, Any]:
         return host.submit_turn(session_id=session_id, **body.model_dump())
 
-    @app.post("/api/v1/sessions/{session_id}/subagent-demo", status_code=202)
-    async def start_subagent_demo(session_id: str) -> dict[str, Any]:
-        return host.start_subagent_demo(session_id)
-
-    @app.get("/api/v1/sessions/{session_id}/subagent-demo")
-    async def latest_subagent_demo(session_id: str) -> dict[str, Any]:
-        return {"run": host.latest_subagent_demo(session_id)}
-
     @app.get("/api/v1/sessions/{session_id}/subagent-runs")
     async def subagent_runs(session_id: str) -> dict[str, Any]:
         return {"runs": host.subagent_runs(session_id)}
-
-    @app.get("/api/v1/subagent-demos/{run_id}")
-    async def subagent_demo(run_id: str) -> dict[str, Any]:
-        return host.subagent_demo(run_id)
 
     @app.post("/api/v1/subagent-tasks/{task_id}/cancel")
     async def cancel_subagent_task(task_id: str) -> dict[str, Any]:

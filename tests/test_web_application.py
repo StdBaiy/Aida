@@ -20,7 +20,6 @@ from coding_agent.repository import SqliteCheckpointRepository
 class FakeHost:
     def __init__(self) -> None:
         self.updated_settings: dict[str, Any] | None = None
-        self.demo: dict[str, Any] | None = None
 
     async def start(self) -> None:
         pass
@@ -38,7 +37,6 @@ class FakeHost:
             "session_id": "session",
             "timeline_id": "timeline",
             "active_operation": None,
-            "active_subagent_demo": None,
             "pending_approvals": [],
         }
 
@@ -67,20 +65,9 @@ class FakeHost:
     async def create_session(self) -> dict[str, Any]:
         return {"session_id": "new-session"}
 
-    def start_subagent_demo(self, session_id: str) -> dict[str, Any]:
-        self.demo = {"run_id": "demo-1", "session_id": session_id, "status": "running"}
-        return self.demo
-
-    def latest_subagent_demo(self, session_id: str) -> dict[str, Any] | None:
-        return self.demo if self.demo and self.demo["session_id"] == session_id else None
-
     def subagent_runs(self, session_id: str) -> list[dict[str, Any]]:
-        run = self.latest_subagent_demo(session_id)
-        return [run] if run is not None else []
-
-    def subagent_demo(self, run_id: str) -> dict[str, Any]:
-        assert self.demo is not None and self.demo["run_id"] == run_id
-        return self.demo
+        del session_id
+        return []
 
     def cancel_subagent_task(self, task_id: str) -> dict[str, Any]:
         return {"ok": True, "task_id": task_id, "status": "cancelled"}
@@ -550,14 +537,15 @@ def test_api_bootstrap_cookie_csrf_and_origin() -> None:
         assert host.updated_settings["main_agent_model_call_limit"] == 30
         assert host.updated_settings["subagent_model_call_limit"] == 40
 
-        started = client.post(
-            "/api/v1/sessions/session/subagent-demo",
-            headers={"X-CSRF-Token": csrf_token},
+        assert client.get("/api/v1/sessions/session/subagent-runs").json() == {"runs": []}
+        assert client.get("/api/v1/sessions/session/subagent-demo").status_code == 404
+        assert (
+            client.post(
+                "/api/v1/sessions/session/subagent-demo",
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code
+            == 404
         )
-        assert started.status_code == 202
-        assert started.json()["run_id"] == "demo-1"
-        assert client.get("/api/v1/sessions/session/subagent-demo").json()["run"] == started.json()
-        assert client.get("/api/v1/subagent-demos/demo-1").json() == started.json()
         cancelled = client.post(
             "/api/v1/operations/operation-1/cancel",
             headers={"X-CSRF-Token": csrf_token},

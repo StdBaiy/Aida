@@ -1,4 +1,4 @@
-"""Two-worker asynchronous subagent MVP and deterministic demo workflow."""
+"""Asynchronous subagent orchestration."""
 
 from __future__ import annotations
 
@@ -20,13 +20,11 @@ from coding_agent.prompting import child_contract, phase_context
 from coding_agent.repository import new_id
 from coding_agent.subagents.repository import SubagentRepository
 from coding_agent.subagents.results import build_result_envelope
-from coding_agent.subagents.tools import AttemptToolRuntime
 from coding_agent.subagents.workspace import SubagentWorkspaceManager
 from coding_agent.tracing import MetricsLangSmithExporter, TraceRecorder, TraceStore
 from coding_agent.tracing.context import active_recorder
 from coding_agent.workspace.mutation import acquire_workspace_mutation
 
-_ALLOWED_TOOLS = ("mock_sleep", "write_deliverable")
 _CHILD_TOOLS = frozenset(
     {
         "list_files",
@@ -518,36 +516,6 @@ class SubagentDemoManager:
 
         future.add_done_callback(settled)
 
-    def _submit_demo_task(
-        self,
-        run_id: str,
-        task_id: str,
-        attempt_id: str,
-        requires_revision: bool,
-    ) -> None:
-        cancelled = threading.Event()
-        self._attempt_cancellations[attempt_id] = cancelled
-        future = self.executor.submit(
-            self._run_task,
-            run_id,
-            task_id,
-            requires_revision,
-            cancelled,
-        )
-        self._futures.add(future)
-        self._task_futures[task_id] = future
-
-        def settled(done: Future[None]) -> None:
-            with self._lock:
-                self._futures.discard(done)
-                if self._task_futures.get(task_id) is done:
-                    self._task_futures.pop(task_id, None)
-                for candidate, token in list(self._attempt_cancellations.items()):
-                    if token is cancelled:
-                        self._attempt_cancellations.pop(candidate, None)
-
-        future.add_done_callback(settled)
-
     def cancel_task(
         self,
         task_id: str,
@@ -706,80 +674,11 @@ class SubagentDemoManager:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.repository.close()
 
-    def start_demo(self, session_id: str) -> dict[str, Any]:
-        """Create two tasks and return immediately while their workers run."""
-        with self._lock:
-            if active := self.repository.active_run(session_id):
-                raise fail(
-                    "SUBAGENT_DEMO_ACTIVE",
-                    f"Demo {active['run_id']} is already running for this session.",
-                )
-            base_commit = self.workspaces.head_commit()
-            run_id = self.repository.create_run(session_id, base_commit)
-            definitions = (
-                (
-                    "Agent A",
-                    "生成通过验收的异步执行报告",
-                    f".coding-agent-demo/{run_id}/agent-a.md",
-                    False,
-                ),
-                (
-                    "Agent B",
-                    "先暴露验收失败，再根据主 Agent 反馈完成返工",
-                    f".coding-agent-demo/{run_id}/agent-b.md",
-                    True,
-                ),
-            )
-            jobs: list[tuple[str, str, bool]] = []
-            for name, objective, output_path, requires_revision in definitions:
-                task_id = self.repository.create_task(
-                    run_id=run_id,
-                    session_id=session_id,
-                    name=name,
-                    objective=objective,
-                    output_path=output_path,
-                    scope=[output_path],
-                    acceptance=[
-                        "Only the declared deliverable path changes.",
-                        "verification_status equals pass.",
-                    ],
-                )
-                attempt_id = self.repository.create_attempt(
-                    task_id=task_id,
-                    attempt_number=1,
-                    base_commit=base_commit,
-                    allowed_tools=_ALLOWED_TOOLS,
-                )
-                self._event(
-                    run_id,
-                    task_id,
-                    attempt_id,
-                    "attempt.queued",
-                    {
-                        "attempt_number": 1,
-                        "allowed_tools": list(_ALLOWED_TOOLS),
-                        "base_commit": base_commit,
-                    },
-                )
-                jobs.append((task_id, attempt_id, requires_revision))
-            self.repository.set_run_status(run_id, "running")
-            for task_id, attempt_id, requires_revision in jobs:
-                self._submit_demo_task(
-                    run_id,
-                    task_id,
-                    attempt_id,
-                    requires_revision,
-                )
-            return self.repository.run(run_id)
-
-    def latest(self, session_id: str) -> dict[str, Any] | None:
-        return self.repository.latest_run(session_id)
-
     def inspect(self, run_id: str) -> dict[str, Any]:
         try:
             return self.repository.run(run_id)
         except KeyError as exc:
-            raise fail("SUBAGENT_DEMO_NOT_FOUND", f"Unknown demo run: {run_id}") from exc
+            raise fail("SUBAGENT_RUN_NOT_FOUND", f"Unknown subagent run: {run_id}") from exc
 
     def request_revision(
         self,
@@ -1454,264 +1353,6 @@ class SubagentDemoManager:
         if isinstance(exc, CodingAgentError):
             return {"ok": False, "error_code": exc.code, "message": exc.user_message}
         return {"ok": False, "error_code": "SUBAGENT_ERROR", "message": str(exc)}
-
-    def _run_task(
-        self,
-        run_id: str,
-        task_id: str,
-        requires_revision: bool,
-        cancelled: threading.Event,
-    ) -> None:
-        try:
-            first = self.repository.task(task_id)
-            attempt_id = str(first["active_attempt_id"])
-            accepted = self._run_attempt(
-                run_id=run_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                should_pass=not requires_revision,
-                cancelled=cancelled,
-            )
-            if not accepted and requires_revision:
-                rejected = self.repository.attempt(attempt_id)
-                result_commit = str(rejected["result_commit"])
-                feedback = (
-                    "验收项 verification_status 未通过；请保留现有交付物，"
-                    "将状态修正为 pass 后重新提交。"
-                )
-                self.repository.update_task(
-                    task_id,
-                    status="revision_required",
-                    feedback=feedback,
-                )
-                self._event(
-                    run_id,
-                    task_id,
-                    attempt_id,
-                    "parent.feedback",
-                    {
-                        "decision": "REVISE",
-                        "message": feedback,
-                        "blocking_finding": "verification_status must equal pass",
-                    },
-                )
-                next_attempt_id = self.repository.create_attempt(
-                    task_id=task_id,
-                    attempt_number=2,
-                    base_commit=result_commit,
-                    allowed_tools=_ALLOWED_TOOLS,
-                )
-                self._attempt_cancellations.pop(attempt_id, None)
-                self._attempt_cancellations[next_attempt_id] = cancelled
-                self._event(
-                    run_id,
-                    task_id,
-                    next_attempt_id,
-                    "attempt.queued",
-                    {
-                        "attempt_number": 2,
-                        "allowed_tools": list(_ALLOWED_TOOLS),
-                        "base_commit": result_commit,
-                        "reason": "主 Agent要求返工",
-                    },
-                )
-                self._run_attempt(
-                    run_id=run_id,
-                    task_id=task_id,
-                    attempt_id=next_attempt_id,
-                    should_pass=True,
-                    cancelled=cancelled,
-                )
-        except CodingAgentError as exc:
-            if exc.code == "SUBAGENT_CANCELLED":
-                task = self.repository.task(task_id)
-                self._mark_cancelled(
-                    run_id,
-                    task_id,
-                    str(task["active_attempt_id"]),
-                )
-            else:
-                self._fail_task(run_id, task_id, exc)
-        except BaseException as exc:
-            self._fail_task(run_id, task_id, exc)
-        finally:
-            self._finish_run_if_ready(run_id)
-
-    def _run_attempt(
-        self,
-        *,
-        run_id: str,
-        task_id: str,
-        attempt_id: str,
-        should_pass: bool,
-        cancelled: threading.Event,
-    ) -> bool:
-        task = self.repository.task(task_id)
-        attempt = self.repository.attempt(attempt_id)
-        attempt_number = int(attempt["attempt_number"])
-        worktree, attempt_workspace, branch = self.workspaces.create_attempt(
-            run_id=run_id,
-            task_name=str(task["name"]),
-            attempt_id=attempt_id,
-            attempt_number=attempt_number,
-            base_commit=str(attempt["base_commit"]),
-        )
-        self.repository.update_attempt(
-            attempt_id,
-            status="running",
-            worktree_path=str(worktree),
-            started_at=utc_now().isoformat(),
-        )
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "agent.started",
-            {
-                "attempt_number": attempt_number,
-                "branch": branch,
-                "worktree": str(worktree),
-            },
-        )
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "plan.updated",
-            {
-                "summary": "执行授权的等待工具，生成交付物，提交 commit 并等待验收。",
-                "steps": ["运行 mock_sleep", "写入交付物", "提交结果", "等待验收"],
-            },
-        )
-        runtime = AttemptToolRuntime(
-            workspace=attempt_workspace,
-            allowed_tools=tuple(json.loads(str(attempt["allowed_tools_json"]))),
-            cancelled=cancelled,
-            on_event=lambda event_type, payload: self._event(
-                run_id,
-                task_id,
-                attempt_id,
-                event_type,
-                payload,
-            ),
-        )
-        runtime.invoke("mock_sleep", {"seconds": 10})
-        status = "pass" if should_pass else "fail"
-        content = (
-            f"# {task['name']} deliverable\n\n"
-            f"attempt: {attempt_number}\n"
-            f"verification_status: {status}\n"
-            f"allowed_tools: {', '.join(_ALLOWED_TOOLS)}\n"
-        )
-        runtime.invoke(
-            "write_deliverable",
-            {"path": str(task["output_path"]), "content": content},
-        )
-        if cancelled.is_set():
-            raise fail("SUBAGENT_CANCELLED", "Subagent execution was cancelled.")
-        result_commit = self.workspaces.commit(
-            worktree,
-            message=f"demo(subagent): {task['name']} attempt {attempt_number}",
-        )
-        self.repository.update_attempt(
-            attempt_id,
-            status="completed",
-            result_commit=result_commit,
-            ended_at=utc_now().isoformat(),
-        )
-        self.repository.update_task(task_id, status="awaiting_review")
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "result.committed",
-            {
-                "result_commit": result_commit,
-                "output_path": task["output_path"],
-            },
-        )
-        return self._review_and_integrate(run_id, task_id, attempt_id)
-
-    def _review_and_integrate(self, run_id: str, task_id: str, attempt_id: str) -> bool:
-        task = self.repository.task(task_id)
-        attempt = self.repository.attempt(attempt_id)
-        result_commit = str(attempt["result_commit"])
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "review.started",
-            {"checks": ["scope", "verification_status", "result_commit"]},
-        )
-        expected_repo_path = (self.workspace.root / str(task["output_path"])).relative_to(
-            self.workspace.repo_root
-        )
-        changed = self.workspaces.changed_paths(str(attempt["base_commit"]), result_commit)
-        content = self.workspaces.file_at_commit(result_commit, str(task["output_path"]))
-        scope_ok = changed == [expected_repo_path.as_posix()]
-        verification_ok = "verification_status: pass" in content
-        if not scope_ok or not verification_ok:
-            findings = []
-            if not scope_ok:
-                findings.append("提交包含授权范围外的文件")
-            if not verification_ok:
-                findings.append("verification_status 不是 pass")
-            self.repository.update_attempt(
-                attempt_id,
-                status="rejected",
-                ended_at=utc_now().isoformat(),
-            )
-            self._event(
-                run_id,
-                task_id,
-                attempt_id,
-                "review.rejected",
-                {
-                    "decision": "REVISE",
-                    "findings": findings,
-                    "changed_paths": changed,
-                },
-            )
-            return False
-
-        self.repository.update_attempt(attempt_id, status="accepted")
-        self.repository.update_task(
-            task_id,
-            status="integrating",
-            accepted_attempt_id=attempt_id,
-        )
-        integration_commit = self.workspaces.integrate(
-            run_id,
-            task_id,
-            result_commit,
-        )
-        self.repository.update_task(
-            task_id,
-            status="merged",
-            integration_commit=integration_commit,
-        )
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "review.accepted",
-            {
-                "decision": "ACCEPT",
-                "changed_paths": changed,
-                "verification_status": "pass",
-            },
-        )
-        self._event(
-            run_id,
-            task_id,
-            attempt_id,
-            "integration.completed",
-            {
-                "integration_commit": integration_commit,
-                "target": f"refs/coding-agent/subagent-integrations/{run_id}/{task_id}",
-            },
-        )
-        return True
 
     def _fail_task(self, run_id: str, task_id: str, exc: BaseException) -> None:
         task = self.repository.task(task_id)

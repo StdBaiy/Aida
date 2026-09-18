@@ -517,7 +517,7 @@ test("new session is created on first input while the previous session runs", as
   });
 
   await page.goto("/");
-  await expect(page.locator(".subagent-demo")).toHaveCount(1);
+  await expect(page.locator(".subagent-run")).toHaveCount(1);
   await expect(page.getByTitle("停止当前任务")).toBeVisible();
   const newTask = page.getByRole("button", { name: "新建任务" });
   await newTask.click();
@@ -525,7 +525,7 @@ test("new session is created on first input while the previous session runs", as
   await expect(page.locator(".session-row")).toHaveCount(1);
   await expect(page.locator(".session-row").filter({ hasText: "已有任务" }).locator(".spin"))
     .toBeVisible();
-  await expect(page.locator(".subagent-demo")).toHaveCount(0);
+  await expect(page.locator(".subagent-run")).toHaveCount(0);
   await expect(page.getByText("从一个具体任务开始")).toBeVisible();
 
   await page.getByPlaceholder("描述你希望 Agent 完成的任务").fill("第一条消息");
@@ -1521,7 +1521,7 @@ test("renders independent subagent cards and revision evidence", async ({ page }
   await expect(page.getByText("#2 通过")).toBeVisible();
   await expect(page.getByText("主 Agent 反馈", { exact: true })).toBeVisible();
   await expect(page.getByText("结果已集成")).toBeVisible();
-  await expect(page.locator(".turn-group .subagent-demo")).toHaveCount(1);
+  await expect(page.locator(".turn-group .subagent-run")).toHaveCount(1);
   await page.getByText("任务契约与结果证据").first().click();
   await expect(page.getByText("verification_status 必须为 pass").first()).toBeVisible();
   const overflow = await page.evaluate(

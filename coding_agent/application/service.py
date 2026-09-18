@@ -228,25 +228,13 @@ class CodingAgentHost:
             "timeline_id": timeline["timeline_id"],
             "active_operation": selected_operation,
             "active_operations": active_operations,
-            "active_subagent_demo": self.subagents.repository.active_run(self.session_id),
             "pending_agent_wakes": self.subagents.repository.pending_wakes(self.session_id),
             "pending_approvals": self.journal.pending_approvals(),
         }
 
-    def start_subagent_demo(self, session_id: str) -> dict[str, Any]:
-        self.repository.validate_workspace(session_id, self.workspace)
-        return self.subagents.start_demo(session_id)
-
-    def latest_subagent_demo(self, session_id: str) -> dict[str, Any] | None:
-        self.repository.validate_workspace(session_id, self.workspace)
-        return self.subagents.latest(session_id)
-
     def subagent_runs(self, session_id: str) -> list[dict[str, Any]]:
         self.repository.validate_workspace(session_id, self.workspace)
         return self.subagents.repository.runs(session_id)
-
-    def subagent_demo(self, run_id: str) -> dict[str, Any]:
-        return self.subagents.inspect(run_id)
 
     def cancel_subagent_task(self, task_id: str) -> dict[str, Any]:
         return self.subagents.cancel_task(task_id)
@@ -1319,10 +1307,7 @@ class WorkspaceManager:
         "resolve_approval",
         "select_session",
         "sessions",
-        "start_subagent_demo",
-        "latest_subagent_demo",
         "subagent_runs",
-        "subagent_demo",
         "submit_restore",
         "submit_context_compaction",
         "submit_turn",
@@ -1381,7 +1366,6 @@ class WorkspaceManager:
             "timeline_id": None,
             "active_operation": None,
             "active_operations": [],
-            "active_subagent_demo": None,
             "pending_agent_wakes": [],
             "pending_approvals": [],
         }
@@ -1417,7 +1401,7 @@ class WorkspaceManager:
                 self.active is not None
                 and self.active.subagents.repository.active_run(self.active.session_id) is not None
             ):
-                raise fail("WORKSPACE_BUSY", "Wait for the subagent demo to finish.")
+                raise fail("WORKSPACE_BUSY", "Wait for the active subagent run to finish.")
             requested = Path(path).expanduser()
             if self.active is not None:
                 try:

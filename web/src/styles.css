@@ -887,15 +887,11 @@ button:disabled {
   margin-bottom: 20px;
 }
 
-.demo-launch {
-  flex: 0 0 auto;
-}
-
-.subagent-demo {
+.subagent-run {
   margin-bottom: 26px;
 }
 
-.subagent-demo-header {
+.subagent-run-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -903,14 +899,14 @@ button:disabled {
   margin-bottom: 10px;
 }
 
-.subagent-demo-header > div:first-child {
+.subagent-run-header > div:first-child {
   display: flex;
   min-width: 0;
   align-items: baseline;
   gap: 9px;
 }
 
-.subagent-demo-header strong {
+.subagent-run-header strong {
   font-size: 13px;
 }
 
@@ -2747,12 +2743,6 @@ button:disabled {
     padding: 0 12px;
   }
 
-  .demo-launch {
-    min-height: 30px;
-    padding: 0 9px;
-    font-size: 10px;
-  }
-
   .messages {
     padding: 16px 12px;
   }
@@ -2761,7 +2751,7 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .subagent-demo-header > div:first-child {
+  .subagent-run-header > div:first-child {
     align-items: flex-start;
     flex-direction: column;
     gap: 2px;

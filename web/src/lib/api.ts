@@ -9,7 +9,6 @@ export type HostStatus = {
   csrf_token: string;
   active_operation: Operation | null;
   active_operations?: Operation[];
-  active_subagent_demo: { run_id: string; status: string } | null;
   pending_approvals: Approval[];
 };
 
@@ -78,7 +77,7 @@ export type SubagentTask = {
   events: SubagentEvent[];
 };
 
-export type SubagentDemo = {
+export type SubagentRun = {
   run_id: string;
   session_id: string;
   status: string;

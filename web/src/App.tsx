@@ -67,7 +67,7 @@ import {
   SettingsConfig,
   StreamConnectionState,
   StreamEvent,
-  SubagentDemo,
+  SubagentRun,
   SubagentEvent,
   SubagentTask,
   ToolRunView,
@@ -154,7 +154,6 @@ export function App() {
   >({});
   const runtimeBySessionRef = useRef(runtimeBySession);
   runtimeBySessionRef.current = runtimeBySession;
-  const [demoStarting, setDemoStarting] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("changes");
   const [selectedDiff, setSelectedDiff] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -265,7 +264,7 @@ export function App() {
   const subagentRuns = useQuery({
     queryKey: ["subagent-runs", sessionId],
     queryFn: () =>
-      request<{ runs: SubagentDemo[] }>(
+      request<{ runs: SubagentRun[] }>(
         `/api/v1/sessions/${sessionId}/subagent-runs`,
       ),
     enabled: Boolean(sessionId) && !newTaskDraft,
@@ -907,26 +906,6 @@ export function App() {
     }
   };
 
-  const startSubagentDemo = async () => {
-    if (!sessionId || demoStarting) return;
-    setDemoStarting(true);
-    setError("");
-    try {
-      const run = await post<SubagentDemo>(
-        `/api/v1/sessions/${sessionId}/subagent-demo`,
-        {},
-      );
-      queryClient.setQueryData<{ runs: SubagentDemo[] }>(
-        ["subagent-runs", sessionId],
-        (current) => ({ runs: [...(current?.runs ?? []), run] }),
-      );
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setDemoStarting(false);
-    }
-  };
-
   const cancelSubagentTask = async (taskId: string) => {
     setError("");
     try {
@@ -1270,9 +1249,6 @@ export function App() {
             contextUsage={contextUsage.data ?? null}
             compressionState={runtime.compressionState}
             onCompact={() => void compactContext()}
-            demoRunning={agentRuns.some((run) => run.status === "running")}
-            demoStarting={demoStarting}
-            onStartDemo={() => void startSubagentDemo()}
           />
           <div
             className="messages"
@@ -1323,8 +1299,8 @@ export function App() {
                   {agentRuns
                     .filter((run) => run.turn_id === item.turn.turn_id)
                     .map((run) => (
-                      <SubagentDemoPanel
-                        demo={run}
+                      <SubagentRunPanel
+                        run={run}
                         key={run.run_id}
                         onCancel={(taskId) => void cancelSubagentTask(taskId)}
                       />
@@ -1339,8 +1315,8 @@ export function App() {
               ),
             )}
             {unboundRuns.map((run) => (
-              <SubagentDemoPanel
-                demo={run}
+              <SubagentRunPanel
+                run={run}
                 key={run.run_id}
                 onCancel={(taskId) => void cancelSubagentTask(taskId)}
               />
@@ -1364,8 +1340,8 @@ export function App() {
               />
             ) : null}
             {pendingRuns.map((run) => (
-              <SubagentDemoPanel
-                demo={run}
+              <SubagentRunPanel
+                run={run}
                 key={run.run_id}
                 onCancel={(taskId) => void cancelSubagentTask(taskId)}
               />
@@ -1694,18 +1670,12 @@ function ConversationHeader({
   contextUsage,
   compressionState,
   onCompact,
-  demoRunning,
-  demoStarting,
-  onStartDemo,
 }: {
   running: boolean;
   turnCount: number;
   contextUsage: ContextUsage | null;
   compressionState: SessionRuntimeState["compressionState"];
   onCompact: () => void;
-  demoRunning: boolean;
-  demoStarting: boolean;
-  onStartDemo: () => void;
 }) {
   return (
     <div className="conversation-header">
@@ -1722,18 +1692,6 @@ function ConversationHeader({
           onCompact={onCompact}
         />
       </div>
-      <button
-        className="secondary-button demo-launch"
-        onClick={onStartDemo}
-        disabled={demoRunning || demoStarting}
-      >
-        {demoRunning || demoStarting ? (
-          <LoaderCircle size={14} className="spin" />
-        ) : (
-          <Play size={14} />
-        )}
-        {demoRunning ? "双 Agent 执行中" : demoStarting ? "正在启动" : "运行双 Agent Demo"}
-      </button>
     </div>
   );
 }
@@ -1818,32 +1776,32 @@ function EmptyConversation() {
   );
 }
 
-function SubagentDemoPanel({
-  demo,
+function SubagentRunPanel({
+  run,
   onCancel,
 }: {
-  demo: SubagentDemo;
+  run: SubagentRun;
   onCancel: (taskId: string) => void;
 }) {
-  const completed = demo.tasks.filter((task) => task.status === "merged").length;
+  const completed = run.tasks.filter((task) => task.status === "merged").length;
   return (
-    <section className="subagent-demo" aria-label="双子 Agent 演示">
-      <div className="subagent-demo-header">
+    <section className="subagent-run" aria-label="子 Agent 运行">
+      <div className="subagent-run-header">
         <div>
           <span className="subagent-kicker">SUBAGENT RUN</span>
           <strong>并行交付与验收</strong>
         </div>
         <div className="subagent-run-state">
-          {demo.status === "running" ? (
+          {run.status === "running" ? (
             <LoaderCircle size={14} className="spin" />
           ) : (
             <Check size={14} />
           )}
-          {completed}/{demo.expected_task_count ?? demo.tasks.length} 已集成
+          {completed}/{run.expected_task_count ?? run.tasks.length} 已集成
         </div>
       </div>
       <div className="subagent-grid">
-        {demo.tasks.map((task) => (
+        {run.tasks.map((task) => (
           <SubagentCard task={task} key={task.task_id} onCancel={onCancel} />
         ))}
       </div>
